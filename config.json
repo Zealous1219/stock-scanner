@@ -1,0 +1,18 @@
+{
+    "strategy": {
+        "name": "black_horse",
+        "params": {
+            "required_weeks": 3,
+            "min_weekly_bars": 12
+        }
+    },
+    "stock_pool": {
+        "type": "zz500",
+        "description": "可选值: hs300(沪深300), zz500(中证500), sz50(上证50), all(全部A股)"
+    },
+    "data": {
+        "lookback_days": 180,
+        "initial_days": 400,
+        "request_interval": 0.5
+    }
+}

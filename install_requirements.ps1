@@ -1,0 +1,3 @@
+$ErrorActionPreference = "Stop"
+
+py -3.13 -m pip install -r requirements.txt

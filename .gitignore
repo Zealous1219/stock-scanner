@@ -1,0 +1,7 @@
+# 保留 data 文件夹结构但忽略其内容
+data/*
+!data/.gitkeep
+
+# 保留 output 文件夹结构但忽略其内容
+output/*
+!output/.gitkeep
