@@ -7,7 +7,7 @@ def list_market_cap_summary():
     """列出所有股票的市值信息"""
 
     # 读取包含市值信息的CSV文件
-    input_file = "output/black_horse_candidates_with_market_cap_2026-04-15.csv"
+    input_file = "output/black_horse_candidates_with_market_cap_2026-04-21.csv"
 
     if not os.path.exists(input_file):
         print(f"文件不存在: {input_file}")
@@ -29,7 +29,7 @@ def list_market_cap_summary():
 
     print(f"\n成功获取市值的股票 ({len(df_with_market_cap)}只):")
     print("-" * 80)
-    print(f"{'排名':<4} {'代码':<12} {'名称':<20} {'市值(亿元)':<15} {'市盈率':<10} {'行业':<30}")
+    print(f"{'排名':<4} {'代码':<12} {'名称':<20} {'市值(元)':<25} {'市盈率':<10} {'行业':<30}")
     print("-" * 80)
 
     for i, (idx, row) in enumerate(df_with_market_cap_sorted.iterrows(), 1):

@@ -111,14 +111,14 @@ def get_stock_market_cap(symbol: str) -> dict:
         # 计算市值（如果都有数据）
         if close_price is not None and total_share is not None:
             # 总股本单位是万股，需要转换为股：total_share * 10000
-            # 市值 = 股价 * 总股本（单位：亿元）
-            market_cap = round(close_price * total_share * 10000 / 100000000, 2)
+            # 市值 = 股价 * 总股本（单位：万元）
+            market_cap = round(close_price * total_share * 10000 / 10000, 2)
 
         # 计算市盈率（如果都有数据）
         if market_cap is not None and net_profit is not None and net_profit > 0:
-            # net_profit 单位是万元，需要转换为元：net_profit * 10000
-            # 市盈率 = 市值（元）/ 净利润（元）
-            pe_ratio = round((market_cap * 100000000) / (net_profit * 10000), 2)
+            # market_cap 单位是万元，net_profit 单位也是万元
+            # 市盈率 = 市值（万元）/ 净利润（万元）
+            pe_ratio = round(market_cap / net_profit, 2)
 
         # 获取市净率（PB）可能需要其他API，这里先留空
         pb_ratio = None
@@ -143,7 +143,7 @@ def get_stock_market_cap(symbol: str) -> dict:
 def main():
     """主函数：读取CSV文件并获取股票市值"""
     # 读取CSV文件
-    csv_file = "output/black_horse_candidates_2026-04-15.csv"
+    csv_file = "output/black_horse_candidates_2026-04-21.csv"
 
     try:
         df = pd.read_csv(csv_file)
@@ -180,7 +180,7 @@ def main():
             merged_df = pd.merge(df, result_df, on="code", how="left")
 
             # 保存结果
-            output_file = "output/black_horse_candidates_with_market_cap_2026-04-15.csv"
+            output_file = "output/black_horse_candidates_with_market_cap_2026-04-21.csv"
             merged_df.to_csv(output_file, index=False, encoding="utf-8-sig")
             logger.info(f"结果已保存到: {output_file}")
 
@@ -198,7 +198,7 @@ def main():
             if sorted_df['market_cap'].notna().any():
                 print(f"\n市值排名前10的股票:")
                 print("-"*80)
-                print(f"{'排名':<4} {'代码':<10} {'名称':<15} {'市值(亿元)':<12} {'市盈率':<10} {'行业':<20}")
+                print(f"{'排名':<4} {'代码':<10} {'名称':<15} {'市值(元)':<20} {'市盈率':<10} {'行业':<20}")
                 print("-"*80)
 
                 for i, (_, row) in enumerate(sorted_df.head(10).iterrows(), 1):
