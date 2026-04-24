@@ -5,6 +5,8 @@
 
 内置策略:
     - moving_average: 移动均线策略
+    - black_horse: 黑马周线策略
+    - momentum_reversal_13: 动量反转13周策略
 
 使用示例:
     from strategies import load_strategy
@@ -22,6 +24,7 @@
 
 from strategies.base import BaseStrategy
 from strategies.black_horse import BlackHorseStrategy
+from strategies.momentum_reversal_13 import MomentumReversal13Strategy
 from strategies.moving_average import MovingAverageStrategy
 import os
 import importlib
@@ -35,6 +38,8 @@ BUILTIN_STRATEGIES = {
     'ma': MovingAverageStrategy,
     'black_horse': BlackHorseStrategy,
     'bh': BlackHorseStrategy,
+    'momentum_reversal_13': MomentumReversal13Strategy,
+    'mr13': MomentumReversal13Strategy,
 }
 
 
@@ -125,6 +130,7 @@ def create_strategy_from_config(config: dict) -> BaseStrategy:
 __all__ = [
     'BaseStrategy',
     'BlackHorseStrategy',
+    'MomentumReversal13Strategy',
     'MovingAverageStrategy',
     'load_strategy',
     'create_strategy_from_config',
