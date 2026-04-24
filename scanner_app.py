@@ -215,8 +215,39 @@ def main() -> None:
     strategy_config = config.get("strategy", {})
     env_strategy_name = os.getenv("STRATEGY_NAME")
     if env_strategy_name:
-        strategy_config = {**strategy_config, "name": env_strategy_name}
-        logger.info("Using strategy override from STRATEGY_NAME=%s", env_strategy_name)
+        # 当 STRATEGY_NAME 被设置时，直接从目标策略类读取 DEFAULT_PARAMS 作为参数
+        # 避免旧策略参数污染新策略，也避免通过实例化触发初始化和参数校验
+        try:
+            import importlib
+            from strategies import BUILTIN_STRATEGIES
+
+            normalized_name = env_strategy_name.lower()
+            strategy_class = BUILTIN_STRATEGIES.get(normalized_name)
+
+            if strategy_class is None:
+                try:
+                    module = importlib.import_module(f'strategies.{normalized_name}')
+                    strategy_class = getattr(module, 'Strategy')
+                except (ImportError, AttributeError):
+                    pass
+
+            if strategy_class and hasattr(strategy_class, 'DEFAULT_PARAMS'):
+                default_params = strategy_class.DEFAULT_PARAMS.copy()
+                strategy_config = {
+                    **strategy_config,
+                    "name": env_strategy_name,
+                    "params": default_params
+                }
+                logger.info("Using strategy override from STRATEGY_NAME=%s", env_strategy_name)
+                logger.info("Using target strategy's DEFAULT_PARAMS as params")
+            else:
+                strategy_config = {**strategy_config, "name": env_strategy_name}
+                logger.info("Using strategy override from STRATEGY_NAME=%s (name only)", env_strategy_name)
+
+        except Exception as e:
+            logger.warning(f"Failed to load strategy class {env_strategy_name}: {e}")
+            strategy_config = {**strategy_config, "name": env_strategy_name}
+            logger.info("Using strategy override from STRATEGY_NAME=%s (fallback: name only)", env_strategy_name)
     env_stock_pool = os.getenv("STOCK_POOL")
     stock_pool = env_stock_pool or config.get("stock_pool", {}).get("type", "hs300")
     if env_stock_pool:

@@ -44,6 +44,15 @@ Recommended way (stable and explicit): edit `config.json`.
     "request_interval": 0.5
   }
 }
+OR，
+"strategy": {
+        "name": "momentum_reversal_13",
+        "params": {
+            "min_downtrend_weeks": 10,
+            "min_weekly_bars": 24,
+            "reversal_weeks": 3
+        }
+    }
 ```
 
 Valid built-in strategy names:

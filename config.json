@@ -1,9 +1,10 @@
 {
     "strategy": {
-        "name": "black_horse",
+        "name": "momentum_reversal_13",
         "params": {
-            "required_weeks": 3,
-            "min_weekly_bars": 12
+            "min_downtrend_weeks": 10,
+            "min_weekly_bars": 24,
+            "reversal_weeks": 3
         }
     },
     "stock_pool": {
