@@ -5,3 +5,25 @@ data/*
 # 保留 output 文件夹结构但忽略其内容
 output/*
 !output/.gitkeep
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc.*
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local tooling state
+.claude/
+.continue/
+claude.md
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

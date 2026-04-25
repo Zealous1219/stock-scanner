@@ -12,7 +12,7 @@
 使用方法:
     python check_env.py
 
-作者: AI Assistant
+
 日期: 2026-03-27
 """
 

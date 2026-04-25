@@ -29,8 +29,41 @@ OUTPUT_DIR = "output"
 
 
 def ensure_directories() -> None:
+    """Create necessary directories if they don't exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def should_force_refresh_on_friday(now: datetime) -> bool:
+    """Check if we should force refresh data on Friday after 20:00.
+
+    Returns True if it's Friday after 20:00, False otherwise.
+    """
+    return now.weekday() == 4 and now.hour >= 20  # Friday (weekday 4) after 20:00
+
+
+def get_latest_trading_day(reference_time: datetime | None = None, lookback_days: int = 14) -> str:
+    """Return the latest trading day on or before the reference date."""
+    if reference_time is None:
+        reference_time = datetime.now()
+
+    end_date = reference_time.strftime("%Y-%m-%d")
+    start_date = (reference_time - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    rs = bs.query_trade_dates(start_date=start_date, end_date=end_date)
+
+    if rs.error_code != "0":
+        raise RuntimeError(f"Failed to query trade dates: {rs.error_msg}")
+
+    latest_trading_day = None
+    while rs.next():
+        calendar_date, is_trading_day = rs.get_row_data()
+        if is_trading_day == "1":
+            latest_trading_day = calendar_date
+
+    if latest_trading_day is None:
+        raise RuntimeError(f"No trading day found between {start_date} and {end_date}.")
+
+    return latest_trading_day
 
 
 def get_stock_list(stock_pool: str) -> List[str]:
@@ -49,7 +82,9 @@ def get_stock_list(stock_pool: str) -> List[str]:
     logger.info("Fetching stock list for %s...", pool_name)
 
     if pool_key == "all":
-        rs = getattr(bs, api_name)(day=datetime.now().strftime("%Y-%m-%d"))
+        query_day = get_latest_trading_day()
+        logger.info("Using trading day %s for all-stock pool", query_day)
+        rs = getattr(bs, api_name)(day=query_day)
     else:
         rs = getattr(bs, api_name)()
 
@@ -61,6 +96,26 @@ def get_stock_list(stock_pool: str) -> List[str]:
         raise RuntimeError(f"Failed to fetch stock list for pool {stock_pool}")
 
     df = pd.DataFrame(data_list, columns=rs.fields)
+
+    # 记录实际获取的股票数量
+    logger.info("Fetched %s stocks for %s", len(df), pool_name)
+
+    # 数量校验
+    stock_count = len(df)
+    if pool_key == "hs300":
+        if stock_count < 250 or stock_count > 350:
+            logger.error("baostock returned unexpected stock count for pool %s (hs300): got %s, expected 250-350", pool_name, stock_count)
+            raise RuntimeError(f"baostock returned unexpected stock count for pool {pool_name} (hs300): got {stock_count}, expected 250-350")
+    elif pool_key == "zz500":
+        if stock_count < 450 or stock_count > 600:
+            logger.error("baostock returned unexpected stock count for pool %s (zz500): got %s, expected 450-600", pool_name, stock_count)
+            raise RuntimeError(f"baostock returned unexpected stock count for pool {pool_name} (zz500): got {stock_count}, expected 450-600")
+    elif pool_key == "sz50":
+        if stock_count < 45 or stock_count > 60:
+            logger.error("baostock returned unexpected stock count for pool %s (sz50): got %s, expected 45-60", pool_name, stock_count)
+            raise RuntimeError(f"baostock returned unexpected stock count for pool {pool_name} (sz50): got {stock_count}, expected 45-60")
+    # all 不校验数量
+
     return df["code"].tolist()
 
 
@@ -124,10 +179,24 @@ def load_or_update_data(
 
         latest_date = pd.to_datetime(local_df["date"]).max()
         yesterday = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=1)
-        if latest_date >= yesterday:
+        today_timestamp = pd.Timestamp(datetime.now().date())
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Check if we should force refresh on Friday after 20:00
+        now = datetime.now()
+        force_refresh = should_force_refresh_on_friday(now)
+
+        if force_refresh:
+            # Friday after 20:00: only refresh if we don't have today's data
+            if latest_date >= today_timestamp:
+                # Already have today's data, use cache
+                return local_df.tail(lookback_days), performed_remote_fetch
+            # Otherwise, proceed to fetch new data
+        elif latest_date >= yesterday:
+            # Not Friday after 20:00, use normal cache logic
             return local_df.tail(lookback_days), performed_remote_fetch
 
-        new_data = fetch_historical_data(symbol, latest_date.strftime("%Y-%m-%d"), today)
+        new_data = fetch_historical_data(symbol, latest_date.strftime("%Y-%m-%d"), today_str)
         performed_remote_fetch = True
         if new_data is None or new_data.empty:
             return local_df.tail(lookback_days), performed_remote_fetch
@@ -268,8 +337,13 @@ def main() -> None:
         logger.info("Run log written to %s", log_file)
         return
 
+    logger.info("Logging in to baostock...")
     lg = bs.login()
     logger.info("baostock login: %s", lg.error_msg)
+
+    if lg.error_code != "0":
+        logger.error("baostock login failed: error_code=%s, error_msg=%s", lg.error_code, lg.error_msg)
+        raise RuntimeError(f"baostock login failed: {lg.error_msg}")
 
     try:
         stocks = get_stock_list(stock_pool)
