@@ -101,3 +101,5 @@ Scanner writes into `output/`:
 ## Notes
 
 `black_horse` strategy uses the latest 3 completed weekly bars and ignores the current unfinished week.
+
+Weekly bars are aggregated from cached daily bars with a `W-FRI` anchor; a week is treated as completed only after the relevant week's last trading day is available, and on normal weeks Friday runs before 20:00 still fall back to the previous completed week.

@@ -2,42 +2,59 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime
 
 import baostock as bs
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
-def get_last_trading_day_of_week(target_date: pd.Timestamp) -> pd.Timestamp:
+
+def get_week_monday_friday(target_date: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """返回指定日期所在自然周的周一和周五。
+
+    使用固定的周五锚点（W-FRI），即使最后交易日是周四，
+    完成周线的锚点也仍然应该是该周对应的周五日期。
+    """
+    # 周一：减去 weekday 天数（周一 weekday=0，所以不变）
+    this_week_monday = target_date - pd.Timedelta(days=target_date.weekday())
+    # 周五：周一 + 4 天
+    this_week_friday = this_week_monday + pd.Timedelta(days=4)
+    return this_week_monday, this_week_friday
+
+
+def get_last_trading_day_of_week(target_date: pd.Timestamp) -> pd.Timestamp | None:
     """返回指定日期所在周的最后一个交易日。
 
     规则：
     1. 查找本周一到周五的交易日历
     2. 返回本周最后一个交易日（可能是周五、周四等）
-    3. 如果本周没有交易日（极端情况），返回上周五
+    3. 如果本周没有交易日，返回 None（无法确认完成状态）
+    4. 如果查询失败，返回 None（不能误判本周为完成）
+
+    Returns:
+        pd.Timestamp: 本周最后一个交易日
+        None: 查询失败或无法确认本周完成状态
     """
-    # 计算本周的周一和周五
-    weekday = target_date.weekday()
+    this_week_monday, this_week_friday = get_week_monday_friday(target_date)
 
-    # 计算本周的周一（可能在上周）
-    days_to_monday = 0 - weekday
-    if days_to_monday > 0:
-        days_to_monday = days_to_monday - 7
-    this_week_monday = target_date + pd.Timedelta(days=days_to_monday)
-
-    # 计算本周的周五（可能在下周）
-    days_to_friday = (4 - weekday) % 7
-    this_week_friday = target_date + pd.Timedelta(days=days_to_friday)
-
-    # 查询本周一到周五的交易日历
     start_date = this_week_monday.strftime("%Y-%m-%d")
     end_date = this_week_friday.strftime("%Y-%m-%d")
 
     try:
         rs = bs.query_trade_dates(start_date=start_date, end_date=end_date)
         if rs.error_code != "0":
-            # 如果查询失败，保守返回上周五
-            return this_week_friday - pd.Timedelta(days=7)
+            # 查询失败，明确记录日志并返回 None
+            logger.error(
+                "交易日历查询失败 - target_date=%s, query_range=[%s, %s], error_code=%s, error_msg=%s",
+                target_date.date(),
+                start_date,
+                end_date,
+                rs.error_code,
+                rs.error_msg,
+            )
+            return None
 
         trading_days = []
         while rs.next():
@@ -49,11 +66,24 @@ def get_last_trading_day_of_week(target_date: pd.Timestamp) -> pd.Timestamp:
             # 返回本周最后一个交易日
             return max(trading_days)
         else:
-            # 本周没有交易日（极端情况），返回上周五
-            return this_week_friday - pd.Timedelta(days=7)
-    except Exception:
-        # 如果baostock调用失败，保守返回上周五
-        return this_week_friday - pd.Timedelta(days=7)
+            # 本周没有交易日，无法确认完成状态
+            logger.warning(
+                "本周没有交易日 - target_date=%s, query_range=[%s, %s], 无法确认完成状态",
+                target_date.date(),
+                start_date,
+                end_date,
+            )
+            return None
+    except Exception as exc:
+        # baostock调用失败，明确记录日志并返回 None
+        logger.error(
+            "交易日历查询异常 - target_date=%s, query_range=[%s, %s], exception=%s",
+            target_date.date(),
+            start_date,
+            end_date,
+            exc,
+        )
+        return None
 
 
 def ensure_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -78,7 +108,9 @@ def get_last_completed_week_end(now: datetime | None = None, daily_latest_date: 
     4. Saturday/Sunday: if this week's data is complete, return this Friday; otherwise return previous Friday
 
     This week's data is considered complete if daily_latest_date is on or after
-    the last trading day of this week (which could be a Thursday for holiday-shortened weeks).
+    last trading day of this week (which could be a Thursday for holiday-shortened weeks).
+
+    Returns a Friday anchor point (for W-FRI resample), even if last trading day was Thursday.
     """
     if now is None:
         now = datetime.now()
@@ -87,40 +119,107 @@ def get_last_completed_week_end(now: datetime | None = None, daily_latest_date: 
     weekday = current_date.weekday()
     hour = now.hour
 
-    # Apply rules
-    if weekday < 4:  # Monday-Thursday
-        # Always previous Friday
-        days_since_friday = weekday + 3
-    elif weekday == 4:  # Friday
-        if hour >= 20:
-            # Friday after 20:00
-            if daily_latest_date is not None:
-                # 获取本周最后一个交易日
-                last_trading_day_of_week = get_last_trading_day_of_week(current_date)
-                # 检查是否已经有本周最后一个交易日的数据
-                if daily_latest_date >= last_trading_day_of_week:
-                    return current_date  # This Friday
-                else:
-                    days_since_friday = 7  # Previous Friday
-            else:
-                days_since_friday = 7  # Previous Friday
-        else:
-            # Friday before 20:00
-            days_since_friday = 7  # Previous Friday (last week's)
-    else:  # Saturday or Sunday (weekday >= 5)
-        if daily_latest_date is not None:
-            # 获取本周最后一个交易日
-            last_trading_day_of_week = get_last_trading_day_of_week(current_date)
-            # 检查是否已经有本周最后一个交易日的数据
-            if daily_latest_date >= last_trading_day_of_week:
-                days_since_friday = weekday - 4  # This Friday
-            else:
-                days_since_friday = weekday + 3  # Previous Friday
-        else:
-            days_since_friday = weekday + 3  # Previous Friday
+    # Get the Friday anchor point for the week containing current_date
+    _, this_friday = get_week_monday_friday(current_date)
+    prev_friday = this_friday - pd.Timedelta(days=7)
 
-    result = current_date - pd.Timedelta(days=days_since_friday)
-    return result
+    # Monday-Thursday: always return previous Friday
+    if weekday < 4:
+        logger.debug(
+            "周线完成判定 - now=%s, weekday=%s, 周一到周四回退上周五: %s",
+            now,
+            weekday,
+            prev_friday.date(),
+        )
+        return prev_friday
+
+    # Friday
+    if weekday == 4:
+        # Before 20:00: return previous Friday
+        if hour < 20:
+            logger.debug(
+                "周线完成判定 - now=%s, 周五 20:00 前回退上周五: %s",
+                now,
+                prev_friday.date(),
+            )
+            return prev_friday
+
+        # After 20:00: check if this week's data is complete
+        if daily_latest_date is not None:
+            last_trading_day = get_last_trading_day_of_week(current_date)
+            if last_trading_day is None:
+                # 查询失败，保守回退到上周五
+                logger.warning(
+                    "周线完成判定 - now=%s, daily_latest_date=%s, 交易日历查询失败，保守回退到上周五: %s",
+                    now,
+                    daily_latest_date.date(),
+                    prev_friday.date(),
+                )
+                return prev_friday
+            if daily_latest_date >= last_trading_day:
+                logger.debug(
+                    "周线完成判定 - now=%s, daily_latest_date=%s, 本周最后交易日=%s, 返回本周五锚点: %s",
+                    now,
+                    daily_latest_date.date(),
+                    last_trading_day.date(),
+                    this_friday.date(),
+                )
+                return this_friday  # This week is complete
+            else:
+                logger.debug(
+                    "周线完成判定 - now=%s, daily_latest_date=%s, 本周最后交易日=%s, 数据未到达，回退上周五: %s",
+                    now,
+                    daily_latest_date.date(),
+                    last_trading_day.date(),
+                    prev_friday.date(),
+                )
+                return prev_friday  # This week not complete
+        else:
+            logger.warning(
+                "周线完成判定 - now=%s, daily_latest_date 为 None，回退上周五: %s",
+                now,
+                prev_friday.date(),
+            )
+            return prev_friday  # No daily data
+
+    # Saturday or Sunday (weekday >= 5)
+    # Check if this week's data is complete
+    if daily_latest_date is not None:
+        last_trading_day = get_last_trading_day_of_week(current_date)
+        if last_trading_day is None:
+            # 查询失败，保守回退到上周五
+            logger.warning(
+                "周线完成判定 - now=%s, daily_latest_date=%s, 交易日历查询失败，保守回退到上周五: %s",
+                now,
+                daily_latest_date.date(),
+                prev_friday.date(),
+            )
+            return prev_friday
+        if daily_latest_date >= last_trading_day:
+            logger.debug(
+                "周线完成判定 - now=%s, daily_latest_date=%s, 本周最后交易日=%s, 返回本周五锚点: %s",
+                now,
+                daily_latest_date.date(),
+                last_trading_day.date(),
+                this_friday.date(),
+            )
+            return this_friday  # This week is complete
+        else:
+            logger.debug(
+                "周线完成判定 - now=%s, daily_latest_date=%s, 本周最后交易日=%s, 数据未到达，回退上周五: %s",
+                now,
+                daily_latest_date.date(),
+                last_trading_day.date(),
+                prev_friday.date(),
+            )
+            return prev_friday  # This week not complete
+    else:
+        logger.warning(
+            "周线完成判定 - now=%s, daily_latest_date 为 None，回退上周五: %s",
+            now,
+            prev_friday.date(),
+        )
+        return prev_friday  # No daily data
 
 
 def convert_daily_to_weekly(df: pd.DataFrame, cutoff_date: pd.Timestamp | None = None) -> pd.DataFrame:
