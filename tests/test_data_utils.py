@@ -252,3 +252,53 @@ class TestGetLastCompletedWeekEnd:
 
             # 周三应该返回上周五
             assert result == pd.Timestamp("2026-04-17")
+
+    def test_friday_cutoff_depends_on_hour(self):
+        """证明周五的cutoff结果依赖于hour——这是replay不稳定的根源。
+        hour=8 (<20): 返回上周五
+        hour=23 (>=20): 数据完整则返回本周五
+        """
+        daily_latest_date = pd.Timestamp("2026-04-24")  # Friday
+
+        with patch("data_utils.get_last_trading_day_of_week") as mock_get_last:
+            mock_get_last.return_value = pd.Timestamp("2026-04-24")  # last trading day = Friday
+
+            # Morning run: hour=8 -> previous Friday
+            morning_now = datetime(2026, 4, 24, 8, 0, 0)
+            morning_result = get_last_completed_week_end(morning_now, daily_latest_date)
+            assert morning_result == pd.Timestamp("2026-04-17"), \
+                f"Expected previous Friday, got {morning_result}"
+
+            # Evening run: hour=23 -> this Friday (data complete)
+            evening_now = datetime(2026, 4, 24, 23, 59, 59)
+            evening_result = get_last_completed_week_end(evening_now, daily_latest_date)
+            assert evening_result == pd.Timestamp("2026-04-24"), \
+                f"Expected this Friday, got {evening_result}"
+
+            # The results differ purely because of the hour
+            assert morning_result != evening_result, (
+                "Historical Friday cutoff must differ by hour — "
+                "this is the instability that replay anchor fix addresses"
+            )
+
+    def test_friday_fixed_time_gives_stable_cutoff(self):
+        """证明固定时间(>=20)给出稳定结果，不管外界时间如何。
+        这是 replay anchor 修复后的期望行为。
+        """
+        daily_latest_date = pd.Timestamp("2026-04-24")  # Friday
+
+        with patch("data_utils.get_last_trading_day_of_week") as mock_get_last:
+            mock_get_last.return_value = pd.Timestamp("2026-04-24")
+
+            # All >= 20:00 should give the same result (this Friday if data complete)
+            for hour in [20, 21, 23]:
+                now = datetime(2026, 4, 24, hour, 0, 0)
+                result = get_last_completed_week_end(now, daily_latest_date)
+                assert result == pd.Timestamp("2026-04-24"), \
+                    f"hour={hour}: expected this Friday, got {result}"
+
+            # Also test with the exact normalized replay anchor (23:59:59)
+            replay_now = datetime(2026, 4, 24, 23, 59, 59)
+            result = get_last_completed_week_end(replay_now, daily_latest_date)
+            assert result == pd.Timestamp("2026-04-24"), \
+                f"replay anchor: expected this Friday, got {result}"

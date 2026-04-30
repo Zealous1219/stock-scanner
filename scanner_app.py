@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import time
 from datetime import datetime, timedelta
@@ -491,25 +492,55 @@ def load_full_df_for_replay(
 
 
 def generate_weekly_snapshot_dates(lookback_weeks: int) -> List[datetime]:
-    """Generate weekly Friday dates for the last lookback_weeks.
+    """Generate exactly ``lookback_weeks`` completed Friday snapshot dates.
+
+    Each snapshot represents the moment after a *completed* Friday trading
+    week.  The current week is excluded when it has not yet finished (Friday
+    before 20:00).  Every included Friday is anchored at 23:59:59 so that
+    the weekly cutoff logic in get_last_completed_week_end sees hour >= 20
+    consistently, regardless of when the replay is actually run.
+
+    The date list is built by decrementing from the last completed Friday:
+    this guarantees that ``lookback_weeks=N`` produces exactly N snapshots
+    rather than N or N+1 depending on whether the window interval happens
+    to land on a Friday.
 
     Args:
-        lookback_weeks: Number of weeks to look back from current date
+        lookback_weeks: Number of completed weekly snapshots to generate.
+                        ``lookback_weeks=52`` returns exactly 52 snapshots.
     """
-    end_date = datetime.now()
-    start_date = end_date - timedelta(weeks=lookback_weeks)
+    now = datetime.now()
+    today = now.date()
+    weekday = now.weekday()
 
+    # Last Friday whose trading week is known to be completed.
+    # Mon-Thu:          last week's Friday
+    # Fri before 20:00: last week's Friday (current week not yet finished)
+    # Fri after 20:00:  this Friday
+    # Sat / Sun:        this week's Friday (just passed)
+    if weekday < 4:  # Monday - Thursday
+        last_completed_friday = today - timedelta(days=weekday + 3)
+    elif weekday == 4:  # Friday
+        if now.hour < 20:
+            last_completed_friday = today - timedelta(days=7)
+        else:
+            last_completed_friday = today
+    else:  # Saturday (5) or Sunday (6)
+        last_completed_friday = today - timedelta(days=weekday - 4)
+
+    # Build exactly lookback_weeks snapshots by decrementing from the last
+    # completed Friday.  Decrementing by whole weeks guarantees we always
+    # land on a Friday.
     friday_dates = []
-    current_date = start_date
+    for i in range(lookback_weeks):
+        friday = last_completed_friday - timedelta(weeks=i)
+        snapshot = datetime.combine(
+            friday,
+            datetime.min.time().replace(hour=23, minute=59, second=59),
+        )
+        friday_dates.append(snapshot)
 
-    while current_date <= end_date:
-        if current_date.weekday() == 4:
-            friday_dates.append(current_date)
-        current_date += timedelta(days=1)
-
-    friday_dates = [d for d in friday_dates if d <= end_date]
     friday_dates.sort()
-
     return friday_dates
 
 
@@ -658,6 +689,7 @@ def calculate_forward_returns(
 
     except Exception as exc:
         logger.debug("计算%s前向收益率失败: %s", symbol, exc)
+        raise  # Re-raise to be caught by per-symbol exception handler
 
     return forward_returns
 
@@ -739,7 +771,169 @@ def write_replay_results(results: List[Dict[str, Any]], universe: str, lookback_
     return replay_file
 
 
-def run_weekly_replay_validation() -> None:
+def write_replay_errors(
+    errors: List[Dict[str, Any]],
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+    write_header: bool = True
+) -> str:
+    """Write replay error records to CSV.
+
+    Args:
+        errors: List of error records to write
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+        write_header: Whether to write CSV header (True for new file, False for append)
+    """
+    error_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}_errors.csv")
+
+    if not errors:
+        return error_file
+
+    df = pd.DataFrame(errors)
+
+    if write_header:
+        df.to_csv(error_file, index=False, encoding="utf-8-sig")
+        logger.info("Replay errors written to %s (with header)", error_file)
+    else:
+        df.to_csv(error_file, mode="a", header=False, index=False, encoding="utf-8-sig")
+        logger.info("Replay errors appended to %s (no header)", error_file)
+
+    return error_file
+
+
+def get_replay_checkpoint_path(universe: str, lookback_weeks: int, version: str) -> str:
+    """Return the checkpoint path for a replay experiment."""
+    return os.path.join(
+        VALIDATION_DIR,
+        "replay",
+        f"replay_{universe}_{lookback_weeks}w_{version}.checkpoint.json",
+    )
+
+
+def load_replay_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
+    """Load a replay checkpoint from JSON."""
+    with open(checkpoint_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate_replay_checkpoint(
+    checkpoint: Dict[str, Any],
+    experiment_tag: str,
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+    expected_snapshot_dates: List[str],
+) -> List[str]:
+    """Validate checkpoint identity and return completed snapshots.
+
+    Checkpoint is the only source of truth for completed snapshot state.
+    CSV outputs are result carriers only and must not be used to infer progress.
+
+    The snapshot window identity (``snapshot_dates``) is now validated so
+    that a checkpoint created during an earlier run with a *different*
+    snapshot window is never mistaken for the same experiment.  This
+    prevents silently merging results from two different time windows.
+    """
+    expected_fields = {
+        "experiment_tag": experiment_tag,
+        "universe": universe,
+        "lookback_weeks": lookback_weeks,
+        "version": version,
+    }
+    mismatches = []
+    for key, expected_value in expected_fields.items():
+        actual_value = checkpoint.get(key)
+        if actual_value != expected_value:
+            mismatches.append(f"{key}={actual_value!r} (expected {expected_value!r})")
+
+    if mismatches:
+        mismatch_text = ", ".join(mismatches)
+        raise RuntimeError(
+            "Replay checkpoint does not match current experiment parameters: "
+            f"{mismatch_text}"
+        )
+
+    # Validate snapshot window identity: the full set of snapshot dates
+    # must be identical between the checkpoint and the current run.
+    # Without this, a checkpoint from a run weeks ago could be mistaken
+    # as resume-compatible even though the generated snapshot windows
+    # are different.
+    checkpoint_snapshot_dates = checkpoint.get("snapshot_dates")
+    if checkpoint_snapshot_dates is None:
+        raise RuntimeError(
+            "Replay checkpoint is missing 'snapshot_dates'. "
+            "The checkpoint schema is insufficient to verify that the "
+            "snapshot window is identical to the current run. "
+            "Cannot safely resume — please delete the checkpoint or "
+            "run a fresh replay."
+        )
+    if not isinstance(checkpoint_snapshot_dates, list) or \
+       any(not isinstance(item, str) for item in checkpoint_snapshot_dates):
+        raise RuntimeError(
+            "Replay checkpoint has invalid 'snapshot_dates'; "
+            "expected a list of YYYY-MM-DD strings."
+        )
+    if checkpoint_snapshot_dates != expected_snapshot_dates:
+        c_first = checkpoint_snapshot_dates[0]
+        c_last = checkpoint_snapshot_dates[-1]
+        c_count = len(checkpoint_snapshot_dates)
+        e_first = expected_snapshot_dates[0]
+        e_last = expected_snapshot_dates[-1]
+        e_count = len(expected_snapshot_dates)
+        raise RuntimeError(
+            "Replay checkpoint snapshot window does not match the current run. "
+            f"Checkpoint window: {c_first} → {c_last} ({c_count} snapshots). "
+            f"Current window:   {e_first} → {e_last} ({e_count} snapshots). "
+            "Cannot safely resume — these are different snapshot windows."
+        )
+
+    completed_snapshots = checkpoint.get("completed_snapshots")
+    if not isinstance(completed_snapshots, list) or any(not isinstance(item, str) for item in completed_snapshots):
+        raise RuntimeError("Replay checkpoint has invalid completed_snapshots; expected a list of YYYY-MM-DD strings")
+
+    return completed_snapshots
+
+
+def save_replay_checkpoint(
+    checkpoint_path: str,
+    experiment_tag: str,
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+    completed_snapshots: List[str],
+    snapshot_dates: List[str],
+) -> None:
+    """Persist replay checkpoint JSON for snapshot-level resume.
+
+    ``snapshot_dates`` encodes the full snapshot window identity so that
+    a future resume can verify that it is resuming the *same* window,
+    not a different window generated weeks later.
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    checkpoint: Dict[str, Any] = {
+        "experiment_tag": experiment_tag,
+        "universe": universe,
+        "lookback_weeks": lookback_weeks,
+        "version": version,
+        "snapshot_dates": snapshot_dates,
+        "completed_snapshots": completed_snapshots,
+        "updated_at": now_str,
+    }
+
+    if os.path.exists(checkpoint_path):
+        existing_checkpoint = load_replay_checkpoint(checkpoint_path)
+        checkpoint["created_at"] = existing_checkpoint.get("created_at", now_str)
+    else:
+        checkpoint["created_at"] = now_str
+
+    with open(checkpoint_path, "w", encoding="utf-8") as f:
+        json.dump(checkpoint, f, ensure_ascii=True, indent=2)
+
+
+def run_weekly_replay_validation(resume: bool = True) -> None:
     """Run weekly historical replay validation for the last lookback_weeks.
 
     How to Run:
@@ -800,19 +994,90 @@ def run_weekly_replay_validation() -> None:
         weekly_dates = generate_weekly_snapshot_dates(lookback_weeks)
         logger.info("Generated %s weekly snapshot dates", len(weekly_dates))
 
-        replay_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}.csv")
+        # Build the snapshot window identity once: this list is the
+        # authoritative window for the current run and is stored in the
+        # checkpoint so future resumes can verify they target the same window.
+        snapshot_dates_str = [d.strftime("%Y-%m-%d") for d in weekly_dates]
 
-        if os.path.exists(replay_file):
-            logger.info("Clearing existing replay file: %s", replay_file)
-            open(replay_file, 'w').close()
-        else:
-            logger.info("Creating new replay file: %s", replay_file)
+        replay_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}.csv")
+        error_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}_errors.csv")
+        checkpoint_path = get_replay_checkpoint_path(universe, lookback_weeks, version)
+
+        completed_snapshots: List[str] = []
+        run_mode = "fresh"
+
+        if resume and os.path.exists(checkpoint_path):
+            logger.info("[Replay] Checkpoint detected: %s", checkpoint_path)
+            checkpoint = load_replay_checkpoint(checkpoint_path)
+            completed_snapshots = validate_replay_checkpoint(
+                checkpoint,
+                experiment_tag,
+                universe,
+                lookback_weeks,
+                version,
+                snapshot_dates_str,
+            )
+
+            if not os.path.exists(replay_file):
+                raise RuntimeError(
+                    "Replay checkpoint exists but replay result CSV is missing; "
+                    "refusing to resume because checkpoint is the only progress truth and result carrier is missing"
+                )
+
+            run_mode = "resume"
+        elif resume:
+            logger.info("[Replay] No checkpoint detected; starting fresh replay run")
+
+        completed_snapshot_set = set(completed_snapshots)
+        snapshots_to_process = [
+            snapshot_date for snapshot_date in weekly_dates
+            if snapshot_date.strftime("%Y-%m-%d") not in completed_snapshot_set
+        ]
+
+        logger.info(
+            "[Replay] Run mode=%s completed_snapshots=%d skipped=%d pending=%d",
+            run_mode,
+            len(completed_snapshots),
+            len(weekly_dates) - len(snapshots_to_process),
+            len(snapshots_to_process),
+        )
+
+        if run_mode == "fresh":
+            # Conservative: refuse to silently destroy existing output files
+            # when there is no checkpoint.  The checkpoint is the sole source
+            # of truth; CSV files are just result carriers and must not be
+            # used to infer completion status or overwrite intent.
+            if os.path.exists(replay_file) or os.path.exists(error_file):
+                raise RuntimeError(
+                    "No replay checkpoint found, but existing replay output file(s) "
+                    "are already present.  The checkpoint is the sole source of truth "
+                    "for completed snapshots; replay CSV files are result carriers only "
+                    "and cannot be used to infer progress or overwrite intent.  "
+                    "Refusing to proceed to avoid inconsistent state.  "
+                    "Please manually remove or relocate the existing output file(s) "
+                    "before running the replay again."
+                )
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
 
         full_df_cache: Dict[str, pd.DataFrame | None] = {}
+        SLOW_SYMBOL_THRESHOLD = 3.0  # seconds — warn if a single symbol exceeds this
 
         for snapshot_idx, snapshot_date in enumerate(weekly_dates, 1):
-            logger.info("Processing snapshot %s/%s: %s",
-                       snapshot_idx, len(weekly_dates), snapshot_date.strftime("%Y-%m-%d"))
+            snapshot_start = time.time()
+            snapshot_date_str = snapshot_date.strftime("%Y-%m-%d")
+
+            if snapshot_date_str in completed_snapshot_set:
+                logger.info(
+                    "[Replay] Snapshot %d/%d skipped via checkpoint: date=%s",
+                    snapshot_idx, len(weekly_dates), snapshot_date_str,
+                )
+                continue
+
+            logger.info(
+                "[Replay] Snapshot %d/%d started: date=%s",
+                snapshot_idx, len(weekly_dates), snapshot_date_str,
+            )
 
             context = StrategyContext(
                 now=snapshot_date,
@@ -823,52 +1088,177 @@ def run_weekly_replay_validation() -> None:
             decision = strategy.can_run(context)
             if not decision.should_run:
                 logger.debug("Strategy skipped for %s: %s",
-                           snapshot_date.strftime("%Y-%m-%d"), decision.reason_text)
+                           snapshot_date_str, decision.reason_text)
+
+                # This snapshot has been fully evaluated: the snapshot-level
+                # decision is complete.  Mark it as completed so that resume
+                # will skip it on the next run.
+                snapshot_elapsed = time.time() - snapshot_start
+                logger.info(
+                    "[Replay] Snapshot %d/%d done (no-op): date=%s elapsed=%.1fs "
+                    "processed=0 matched=0 failed=0",
+                    snapshot_idx, len(weekly_dates), snapshot_date_str, snapshot_elapsed,
+                )
+
+                completed_snapshot_set.add(snapshot_date_str)
+                completed_snapshots.append(snapshot_date_str)
+                completed_snapshots.sort()
+                save_replay_checkpoint(
+                    checkpoint_path, experiment_tag, universe, lookback_weeks, version,
+                    completed_snapshots.copy(), snapshot_dates_str,
+                )
                 continue
 
             snapshot_results = []
+            processed_count = 0
+            failed_count = 0
+            snapshot_errors = []
 
             for symbol_idx, symbol in enumerate(stocks, 1):
-                if symbol_idx % 100 == 0:
-                    logger.info("  Progress %s/%s for snapshot %s/%s: %s",
-                               symbol_idx, len(stocks), snapshot_idx, len(weekly_dates), snapshot_date.strftime("%Y-%m-%d"))
+                symbol_start = time.time()
+                stage_times: Dict[str, float] = {}
+                exit_stage = ""
+                matched = False
+                symbol_failed = False
+                error_record = None
+                current_stage = "unknown"
 
-                if symbol not in full_df_cache:
-                    full_df_cache[symbol] = load_full_df_for_replay(
-                        symbol, lookback_days, initial_days, request_interval, required_history_days
+                try:
+                    # Stage: load_full_df_for_replay
+                    if symbol not in full_df_cache:
+                        t0 = time.time()
+                        current_stage = "load_full_df"
+                        full_df_cache[symbol] = load_full_df_for_replay(
+                            symbol, lookback_days, initial_days, request_interval, required_history_days
+                        )
+                        stage_times["load_full_df"] = time.time() - t0
+
+                    full_df = full_df_cache[symbol]
+
+                    if full_df is None or full_df.empty:
+                        exit_stage = "full_df_empty"
+
+                    if not exit_stage:
+                        # Stage: load_historical_data_up_to_date
+                        t0 = time.time()
+                        current_stage = "load_historical"
+                        df = load_historical_data_up_to_date(
+                            symbol, snapshot_date, lookback_days, initial_days, request_interval, full_df=full_df
+                        )
+                        stage_times["load_historical"] = time.time() - t0
+
+                        if df is None or df.empty:
+                            exit_stage = "hist_empty"
+
+                    if not exit_stage:
+                        processed_count += 1
+
+                        # Stage: strategy.scan
+                        t0 = time.time()
+                        current_stage = "scan"
+                        result = strategy.scan(symbol, df, context)
+                        stage_times["scan"] = time.time() - t0
+                        matched = result.matched
+
+                        # Stage: calculate_forward_returns (matched only)
+                        if matched:
+                            t0 = time.time()
+                            current_stage = "calc_returns"
+                            forward_returns = calculate_forward_returns(symbol, result, full_df=full_df)
+                            stage_times["calc_returns"] = time.time() - t0
+
+                            current_stage = "build_record"
+                            replay_record = build_replay_record(
+                                symbol, result, context, forward_returns,
+                                experiment_tag, universe, lookback_weeks
+                            )
+                            snapshot_results.append(replay_record)
+
+                except Exception as exc:
+                    symbol_failed = True
+                    failed_count += 1
+
+                    # Log error
+                    logger.error(
+                        "[Replay] Snapshot %d/%d date=%s symbol %s failed at stage %s: %s: %s",
+                        snapshot_idx, len(weekly_dates), snapshot_date_str, symbol, current_stage,
+                        exc.__class__.__name__, str(exc)
                     )
 
-                full_df = full_df_cache[symbol]
+                    # Create error record
+                    error_record = {
+                        "experiment_tag": experiment_tag,
+                        "snapshot_date": snapshot_date_str,
+                        "snapshot_index": snapshot_idx,
+                        "code": symbol,
+                        "stage": current_stage,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc)
+                    }
+                    snapshot_errors.append(error_record)
 
-                if full_df is None or full_df.empty:
-                    continue
+                # -- Unified symbol-level observability 收口 --
+                symbol_elapsed = time.time() - symbol_start
 
-                df = load_historical_data_up_to_date(
-                    symbol, snapshot_date, lookback_days, initial_days, request_interval, full_df=full_df
-                )
-
-                if df is None or df.empty:
-                    continue
-
-                result = strategy.scan(symbol, df, context)
-
-                if result.matched:
-                    forward_returns = calculate_forward_returns(symbol, result, full_df=full_df)
-
-                    replay_record = build_replay_record(
-                        symbol, result, context, forward_returns,
-                        experiment_tag, universe, lookback_weeks
+                if symbol_idx % 100 == 0 or matched or symbol_failed:
+                    log_msg = (
+                        f"[Replay] Snapshot {snapshot_idx}/{len(weekly_dates)} "
+                        f"symbol {symbol_idx}/{len(stocks)} {symbol} | "
+                        f"matched={matched} elapsed={symbol_elapsed:.2f}s"
                     )
-                    snapshot_results.append(replay_record)
+                    if "scan" in stage_times:
+                        log_msg += f" scan={stage_times['scan']:.2f}s"
+                    if exit_stage:
+                        log_msg += f" exit={exit_stage}"
+                    if symbol_failed:
+                        log_msg += " FAILED"
+                    logger.info(log_msg)
 
+                if symbol_elapsed > SLOW_SYMBOL_THRESHOLD:
+                    stage_detail = ", ".join(
+                        f"{k}={v:.2f}s" for k, v in stage_times.items()
+                    )
+                    warning_msg = (
+                        f"[Replay] Slow symbol {symbol} in snapshot {snapshot_idx} ({snapshot_date_str}): "
+                        f"total={symbol_elapsed:.2f}s [{stage_detail}]"
+                    )
+                    if exit_stage:
+                        warning_msg += f" exit={exit_stage}"
+                    if symbol_failed:
+                        warning_msg += " FAILED"
+                    logger.warning(warning_msg)
+
+            snapshot_elapsed = time.time() - snapshot_start
+
+            # Write replay results if any
             if snapshot_results:
-                write_header = (snapshot_idx == 1) or (os.path.exists(replay_file) and os.path.getsize(replay_file) == 0)
+                write_header = (not os.path.exists(replay_file)) or os.path.getsize(replay_file) == 0
                 write_replay_results(snapshot_results, universe, lookback_weeks, version, write_header=write_header)
-                logger.info("Snapshot %s/%s completed: %s signals written",
-                           snapshot_idx, len(weekly_dates), len(snapshot_results))
-            else:
-                logger.info("Snapshot %s/%s completed: no signals found",
-                           snapshot_idx, len(weekly_dates))
+
+            # Write error records if any
+            if snapshot_errors:
+                error_write_header = (not os.path.exists(error_file)) or os.path.getsize(error_file) == 0
+                write_replay_errors(snapshot_errors, universe, lookback_weeks, version, write_header=error_write_header)
+
+            logger.info(
+                "[Replay] Snapshot %d/%d done: date=%s elapsed=%.1fs "
+                "processed=%d matched=%d failed=%d",
+                snapshot_idx, len(weekly_dates), snapshot_date_str,
+                snapshot_elapsed, processed_count, len(snapshot_results), failed_count,
+            )
+
+            completed_snapshot_set.add(snapshot_date_str)
+            completed_snapshots.append(snapshot_date_str)
+            completed_snapshots.sort()
+            save_replay_checkpoint(
+                checkpoint_path,
+                experiment_tag,
+                universe,
+                lookback_weeks,
+                version,
+                completed_snapshots.copy(),
+                snapshot_dates_str,
+            )
 
         logger.info("Weekly replay validation completed.")
 
