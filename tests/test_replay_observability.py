@@ -15,7 +15,7 @@ import pandas as pd
 import pytest
 
 from scanner_app import run_weekly_replay_validation, generate_weekly_snapshot_dates
-from strategy_runtime import StrategyDecision, StrategyResult
+from strategy_runtime import StrategyDecision, StrategyResult, StrategyContext
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +656,7 @@ class TestFaultTolerance:
         strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
 
         # Make scan raise exception for sh.000002
-        def mock_scan(symbol, df, context):
+        def mock_scan(symbol, df, context, **kwargs):
             if symbol == "sh.000002":
                 raise ValueError("Mocked scan failure")
             return _make_matched_result()
@@ -833,7 +833,7 @@ class TestFaultTolerance:
         strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
 
         # Make scan raise exception for sh.000002 and sh.000004
-        def mock_scan(symbol, df, context):
+        def mock_scan(symbol, df, context, **kwargs):
             if symbol in ["sh.000002", "sh.000004"]:
                 raise ValueError(f"Mocked failure for {symbol}")
             return _make_matched_result()
@@ -1474,8 +1474,9 @@ class TestSnapshotTimeAnchor:
         because the week has completed."""
         # Friday 2026-05-01 21:00 — this week is complete
         mock_dt = self._make_friday_mock(hour=21)
-        with patch("scanner_app.datetime", mock_dt):
-            dates = generate_weekly_snapshot_dates(4)
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-05-01")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
 
         # The last Friday must be 2026-05-01
         last = dates[-1]
@@ -1505,8 +1506,9 @@ class TestSnapshotTimeAnchor:
         mock_dt.combine = datetime.combine
         mock_dt.min = datetime.min
 
-        with patch("scanner_app.datetime", mock_dt):
-            dates = generate_weekly_snapshot_dates(4)
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-05-01")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
 
         last = dates[-1]
         assert last.date().isoformat() == "2026-05-01", (
@@ -1602,7 +1604,7 @@ class TestSnapshotTimeAnchor:
 
         captured_now_values = []
 
-        def fake_scan(symbol, df, context):
+        def fake_scan(symbol, df, context, **kwargs):
             # Simulate what the real strategy does: call get_completed_weekly_bars
             import data_utils
             result = data_utils.get_completed_weekly_bars(df, now=context.now)
@@ -1635,8 +1637,9 @@ class TestSnapshotTimeAnchor:
         last being the last completed Friday anchored at 23:59:59, and
         the first being exactly 51 weeks before it."""
         mock_dt = self._make_friday_mock(hour=21)
-        with patch("scanner_app.datetime", mock_dt):
-            dates = generate_weekly_snapshot_dates(52)
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-05-01")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(52)
 
         assert len(dates) == 52, f"Expected 52 snapshots, got {len(dates)}"
 
@@ -1657,8 +1660,9 @@ class TestSnapshotTimeAnchor:
     def test_lookback_weeks_1_returns_single_snapshot(self):
         """Edge case: lookback_weeks=1 returns exactly the last completed Friday."""
         mock_dt = self._make_friday_mock(hour=21)
-        with patch("scanner_app.datetime", mock_dt):
-            dates = generate_weekly_snapshot_dates(1)
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-05-01")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(1)
 
         assert len(dates) == 1, f"Expected 1 snapshot, got {len(dates)}"
         assert dates[0] == datetime(2026, 5, 1, 23, 59, 59)
@@ -1666,8 +1670,9 @@ class TestSnapshotTimeAnchor:
     def test_lookback_weeks_4_returns_exactly_4_snapshots(self):
         """lookback_weeks=4 must return exactly 4 snapshots."""
         mock_dt = self._make_friday_mock(hour=21)
-        with patch("scanner_app.datetime", mock_dt):
-            dates = generate_weekly_snapshot_dates(4)
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-05-01")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
 
         assert len(dates) == 4, f"Expected 4 snapshots, got {len(dates)}"
 
@@ -1680,6 +1685,89 @@ class TestSnapshotTimeAnchor:
         for i, (actual, expected) in enumerate(zip(dates, expected_dates)):
             assert actual == expected, \
                 f"Snapshot {i}: expected {expected}, got {actual}"
+
+    # ------------------------------------------------------------------
+    # Holiday short-week boundary tests (completed-week fix)
+    # ------------------------------------------------------------------
+
+    def test_holiday_short_week_after_last_trading_day_includes_current_week(self):
+        """节假日短周：当前日期在最后交易日之后，应包含本周。
+
+        Example: 2026-05-01 is a market holiday.  The last trading day of
+        the week is 2026-04-30 (Thu).  Running replay on 2026-05-01 10:00
+        must include the week ending 2026-05-01.
+        """
+        mock_dt = MagicMock()
+        mock_dt.now.return_value = datetime(2026, 5, 1, 10, 0, 0)
+        mock_dt.combine = datetime.combine
+        mock_dt.min = datetime.min
+
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-04-30")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
+
+        last = dates[-1]
+        assert last == datetime(2026, 5, 1, 23, 59, 59), (
+            f"Expected last snapshot 2026-05-01 23:59:59, got {last}"
+        )
+
+    def test_holiday_short_week_last_trading_day_before_20h_excludes_current_week(self):
+        """节假日短周：当前日期等于最后交易日且未到 20:00，不应包含本周。
+
+        Example: 2026-04-30 is the last trading day.  Running at 15:00 on
+        that day must exclude the current week.
+        """
+        mock_dt = MagicMock()
+        mock_dt.now.return_value = datetime(2026, 4, 30, 15, 0, 0)
+        mock_dt.combine = datetime.combine
+        mock_dt.min = datetime.min
+
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-04-30")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
+
+        last = dates[-1]
+        expected_last = datetime(2026, 4, 24, 23, 59, 59)
+        assert last == expected_last, (
+            f"Expected last snapshot {expected_last}, got {last}"
+        )
+
+    def test_holiday_short_week_last_trading_day_after_20h_includes_current_week(self):
+        """节假日短周：当前日期等于最后交易日且已过 20:00，应包含本周.
+
+        Example: 2026-04-30 is the last trading day.  Running at 21:00 on
+        that day must include the current week.
+        """
+        mock_dt = MagicMock()
+        mock_dt.now.return_value = datetime(2026, 4, 30, 21, 0, 0)
+        mock_dt.combine = datetime.combine
+        mock_dt.min = datetime.min
+
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=pd.Timestamp("2026-04-30")):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
+
+        last = dates[-1]
+        assert last == datetime(2026, 5, 1, 23, 59, 59), (
+            f"Expected last snapshot 2026-05-01 23:59:59, got {last}"
+        )
+
+    def test_calendar_query_failure_falls_back_conservatively(self):
+        """交易日历查询失败时保守回退到上周 Friday anchor。"""
+        mock_dt = MagicMock()
+        mock_dt.now.return_value = datetime(2026, 5, 1, 10, 0, 0)
+        mock_dt.combine = datetime.combine
+        mock_dt.min = datetime.min
+
+        with patch("scanner_app.get_last_trading_day_of_week", return_value=None):
+            with patch("scanner_app.datetime", mock_dt):
+                dates = generate_weekly_snapshot_dates(4)
+
+        last = dates[-1]
+        expected_last = datetime(2026, 4, 24, 23, 59, 59)
+        assert last == expected_last, (
+            f"Expected last snapshot {expected_last} after calendar failure, got {last}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1860,3 +1948,488 @@ class TestSnapshotWindowIdentity:
             f"Error must mention cannot safely resume: {message}"
         assert "insufficient" in message.lower() or "missing" in message.lower(), \
             f"Error must mention insufficient/missing schema: {message}"
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Weekly-strategy replay optimization v1
+# ---------------------------------------------------------------------------
+
+class TestWeeklyReplayCachePath:
+    """Verify that the weekly precompute cache is used for weekly strategies
+    and that the optimization does not change business semantics.
+
+    These tests cover:
+    1. precompute_weekly_bars_for_replay is called once per symbol (not per snapshot)
+    2. slice_weekly_bars_for_snapshot is called once per symbol per snapshot
+    3. strategy.scan receives precomputed_weekly (not None) for weekly strategies
+    4. Non-weekly strategies do NOT trigger the weekly cache path
+    5. Fault tolerance: exception during precompute is isolated to that symbol
+    6. Step 1-4 invariants (checkpoint, error CSV, done log) are preserved
+    """
+
+    def _base_config(self):
+        return {
+            "strategy": {"params": {}},
+            "data": {"lookback_days": 180, "initial_days": 400, "request_interval": 0},
+        }
+
+    # ------------------------------------------------------------------
+    # Test 1: precompute called once per symbol, not per snapshot
+    # ------------------------------------------------------------------
+
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.slice_weekly_bars_for_snapshot")
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_precompute_called_once_per_symbol_not_per_snapshot(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute, mock_slice,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write, mock_ensure, mock_exists, mock_getsize,
+    ):
+        """precompute_weekly_bars_for_replay must be called once per symbol
+        regardless of how many snapshots there are."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = self._base_config()
+        mock_stocks.return_value = ["sh.600000", "sh.600001"]
+        # 3 snapshots, 2 symbols → precompute should be called 2 times total
+        mock_dates.return_value = [
+            datetime(2025, 5, 2, 23, 59, 59),
+            datetime(2025, 5, 9, 23, 59, 59),
+            datetime(2025, 5, 16, 23, 59, 59),
+        ]
+
+        weekly_df = _make_df(60)
+        mock_precompute.return_value = weekly_df
+        mock_slice.return_value = weekly_df
+
+        strategy = MagicMock()
+        strategy.name = "momentum_reversal_13"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_unmatched_result()
+        mock_create.return_value = strategy
+
+        run_weekly_replay_validation()
+
+        # 2 symbols × 1 precompute each = 2 total calls
+        assert mock_precompute.call_count == 2, (
+            f"Expected precompute called once per symbol (2), got {mock_precompute.call_count}"
+        )
+        # 2 symbols × 3 snapshots = 6 slice calls
+        assert mock_slice.call_count == 6, (
+            f"Expected slice called once per symbol per snapshot (6), got {mock_slice.call_count}"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 2: strategy.scan receives precomputed_weekly kwarg
+    # ------------------------------------------------------------------
+
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.slice_weekly_bars_for_snapshot")
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_scan_receives_precomputed_weekly_kwarg(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute, mock_slice,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write, mock_ensure, mock_exists, mock_getsize,
+    ):
+        """strategy.scan must be called with precomputed_weekly= for weekly strategies."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = self._base_config()
+        mock_stocks.return_value = ["sh.600000"]
+        mock_dates.return_value = [datetime(2025, 5, 9, 23, 59, 59)]
+
+        sentinel_weekly = _make_df(30)
+        mock_precompute.return_value = sentinel_weekly
+        mock_slice.return_value = sentinel_weekly
+
+        strategy = MagicMock()
+        strategy.name = "momentum_reversal_13"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_unmatched_result()
+        mock_create.return_value = strategy
+
+        run_weekly_replay_validation()
+
+        assert strategy.scan.call_count == 1
+        call_kwargs = strategy.scan.call_args.kwargs
+        assert "precomputed_weekly" in call_kwargs, (
+            f"Expected precomputed_weekly kwarg in scan call, got kwargs={call_kwargs}"
+        )
+        assert call_kwargs["precomputed_weekly"] is sentinel_weekly, (
+            "precomputed_weekly must be the slice returned by slice_weekly_bars_for_snapshot"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 3: non-weekly strategy does NOT use weekly cache
+    # ------------------------------------------------------------------
+
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.slice_weekly_bars_for_snapshot")
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_non_weekly_strategy_does_not_use_weekly_cache(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute, mock_slice,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write, mock_ensure, mock_exists, mock_getsize,
+    ):
+        """A strategy not in _WEEKLY_REPLAY_STRATEGIES must not trigger
+        precompute or slice, and scan must be called without precomputed_weekly."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = self._base_config()
+        mock_stocks.return_value = ["sh.600000"]
+        mock_dates.return_value = [datetime(2025, 5, 9, 23, 59, 59)]
+
+        strategy = MagicMock()
+        # A hypothetical daily strategy name not in _WEEKLY_REPLAY_STRATEGIES
+        strategy.name = "moving_average"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_unmatched_result()
+        mock_create.return_value = strategy
+
+        run_weekly_replay_validation()
+
+        mock_precompute.assert_not_called()
+        mock_slice.assert_not_called()
+        # scan must be called without precomputed_weekly kwarg
+        assert strategy.scan.call_count == 1
+        call_kwargs = strategy.scan.call_args.kwargs
+        assert "precomputed_weekly" not in call_kwargs, (
+            f"Non-weekly strategy must not receive precomputed_weekly, got {call_kwargs}"
+        )
+
+    # ------------------------------------------------------------------
+    # Test 4: precompute exception isolates to that symbol
+    # ------------------------------------------------------------------
+
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.write_replay_errors")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_precompute_exception_isolates_to_symbol(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write_errors, mock_write_results,
+        mock_ensure, mock_exists, mock_getsize, caplog,
+    ):
+        """If precompute_weekly_bars_for_replay raises for one symbol,
+        that symbol is recorded as failed and the snapshot continues."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = self._base_config()
+        mock_stocks.return_value = ["sh.000001", "sh.000002", "sh.000003"]
+        mock_dates.return_value = [datetime(2025, 5, 9, 23, 59, 59)]
+
+        strategy = MagicMock()
+        strategy.name = "momentum_reversal_13"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_matched_result()
+        mock_create.return_value = strategy
+
+        def precompute_side_effect(full_df):
+            # Raise only for the second symbol (detected via call count)
+            if mock_precompute.call_count == 2:
+                raise RuntimeError("Mocked precompute failure")
+            return _make_df(30)
+
+        mock_precompute.side_effect = precompute_side_effect
+
+        with caplog.at_level(logging.ERROR):
+            run_weekly_replay_validation()
+
+        # One error logged for sh.000002
+        error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "failed at stage" in r.message]
+        assert len(error_logs) == 1, f"Expected 1 error log, got {len(error_logs)}"
+        assert "sh.000002" in error_logs[0].message
+
+        # Error CSV written; results CSV written for the two successful symbols
+        mock_write_errors.assert_called_once()
+        mock_write_results.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Test 5: checkpoint/resume semantics preserved with weekly cache
+    # ------------------------------------------------------------------
+
+    @patch("scanner_app.save_replay_checkpoint")
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.slice_weekly_bars_for_snapshot")
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_checkpoint_saved_after_each_snapshot_with_weekly_cache(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute, mock_slice,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write, mock_ensure, mock_exists, mock_getsize,
+        mock_save_checkpoint,
+    ):
+        """Checkpoint must still be saved after each snapshot when weekly
+        cache is active — Step 3 resume semantics must not be broken."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = self._base_config()
+        mock_stocks.return_value = ["sh.600000"]
+        mock_dates.return_value = [
+            datetime(2025, 5, 2, 23, 59, 59),
+            datetime(2025, 5, 9, 23, 59, 59),
+        ]
+
+        weekly_df = _make_df(60)
+        mock_precompute.return_value = weekly_df
+        mock_slice.return_value = weekly_df
+
+        strategy = MagicMock()
+        strategy.name = "momentum_reversal_13"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_unmatched_result()
+        mock_create.return_value = strategy
+
+        run_weekly_replay_validation()
+
+        # One checkpoint save per snapshot
+        assert mock_save_checkpoint.call_count == 2, (
+            f"Expected 2 checkpoint saves (one per snapshot), got {mock_save_checkpoint.call_count}"
+        )
+        # Second save must include both snapshots
+        final_completed = mock_save_checkpoint.call_args_list[-1].args[5]
+        assert "2025-05-02" in final_completed
+        assert "2025-05-09" in final_completed
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Unit tests for the helper functions themselves
+# ---------------------------------------------------------------------------
+
+class TestWeeklyReplayHelpers:
+    """Unit tests for precompute_weekly_bars_for_replay and
+    slice_weekly_bars_for_snapshot in isolation."""
+
+    def _make_daily_df(self, start: str = "2025-01-06", weeks: int = 20) -> pd.DataFrame:
+        """Build a daily DataFrame spanning `weeks` full Mon-Fri weeks."""
+        dates = pd.bdate_range(start=start, periods=weeks * 5)
+        n = len(dates)
+        return pd.DataFrame({
+            "date": dates,
+            "open": [10.0] * n,
+            "high": [10.5] * n,
+            "low": [9.5] * n,
+            "close": [10.0 + i * 0.01 for i in range(n)],
+            "volume": [1000] * n,
+        })
+
+    def test_precompute_returns_friday_anchored_weekly_bars(self):
+        """precompute_weekly_bars_for_replay must return W-FRI weekly bars."""
+        from scanner_app import precompute_weekly_bars_for_replay
+        daily = self._make_daily_df(weeks=8)
+        weekly = precompute_weekly_bars_for_replay(daily)
+
+        assert not weekly.empty
+        # All dates must be Fridays (weekday 4)
+        for d in pd.to_datetime(weekly["date"]):
+            assert d.weekday() == 4, f"Expected Friday, got {d} (weekday={d.weekday()})"
+
+    def test_slice_returns_bars_up_to_snapshot_friday(self):
+        """slice_weekly_bars_for_snapshot must return only bars on or before
+        the snapshot's Friday anchor."""
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        daily = self._make_daily_df(start="2025-01-06", weeks=12)
+        weekly = precompute_weekly_bars_for_replay(daily)
+
+        # Snapshot = Friday 2025-02-28 at 23:59:59
+        snapshot = datetime(2025, 2, 28, 23, 59, 59)
+        sliced = slice_weekly_bars_for_snapshot(weekly, snapshot)
+
+        assert not sliced.empty
+        cutoff = pd.Timestamp("2025-02-28")
+        for d in pd.to_datetime(sliced["date"]):
+            assert d <= cutoff, f"Sliced bar {d} is after cutoff {cutoff}"
+
+    def test_slice_semantic_equivalence_with_get_completed_weekly_bars(self):
+        """The precompute+slice path must produce the same weekly bars as
+        calling get_completed_weekly_bars directly on the daily slice.
+
+        This is the core correctness guarantee for the optimization.
+
+        We mock get_last_trading_day_of_week so the standard path doesn't
+        need a live baostock connection — the mock returns the Friday itself,
+        which is what a normal trading week would return.
+        """
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        from data_utils import get_completed_weekly_bars
+
+        daily = self._make_daily_df(start="2025-01-06", weeks=16)
+
+        # Snapshot = Friday 2025-03-28 at 23:59:59 (fixed time anchor)
+        snapshot = datetime(2025, 3, 28, 23, 59, 59)
+        cutoff_ts = pd.Timestamp(snapshot.date())
+
+        # Path A: precompute + slice (new optimization path)
+        weekly_full = precompute_weekly_bars_for_replay(daily)
+        sliced = slice_weekly_bars_for_snapshot(weekly_full, snapshot)
+
+        # Path B: standard path — filter daily to cutoff, then get_completed_weekly_bars.
+        # Mock get_last_trading_day_of_week so it returns the Friday itself (normal week),
+        # avoiding a live baostock call in the test environment.
+        daily_slice = daily[pd.to_datetime(daily["date"]) <= cutoff_ts].copy()
+        with patch("data_utils.get_last_trading_day_of_week", return_value=pd.Timestamp("2025-03-28")):
+            standard = get_completed_weekly_bars(daily_slice, now=snapshot)
+
+        assert len(sliced) == len(standard), (
+            f"Row count mismatch: precompute+slice={len(sliced)}, standard={len(standard)}"
+        )
+        if not sliced.empty and not standard.empty:
+            pd.testing.assert_frame_equal(
+                sliced.reset_index(drop=True),
+                standard.reset_index(drop=True),
+                check_dtype=False,
+            )
+
+    def test_slice_empty_weekly_returns_empty(self):
+        """slice_weekly_bars_for_snapshot on an empty DataFrame returns empty."""
+        from scanner_app import slice_weekly_bars_for_snapshot
+        empty = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        result = slice_weekly_bars_for_snapshot(empty, datetime(2025, 5, 9, 23, 59, 59))
+        assert result.empty
+
+
+# ---------------------------------------------------------------------------
+# Step 5 patch: MomentumReversal13Strategy.scan precomputed_weekly compat
+# ---------------------------------------------------------------------------
+
+class TestMR13PrecomputedWeeklyCompat:
+    """Verify that MomentumReversal13Strategy.scan accepts the precomputed_weekly
+    kwarg introduced by the weekly replay cache path (Step 5).
+
+    Three cases:
+    1. precomputed_weekly passed → no TypeError, result returned normally
+    2. precomputed_weekly not None → get_completed_weekly_bars NOT called
+    3. precomputed_weekly is None (default) → get_completed_weekly_bars IS called
+    """
+
+    def _make_weekly_df(self, n: int = 20) -> pd.DataFrame:
+        fridays = pd.date_range("2025-01-10", periods=n, freq="W-FRI")
+        return pd.DataFrame({
+            "date": fridays,
+            "open": [10.0] * n,
+            "high": [11.0] * n,
+            "low": [9.0] * n,
+            "close": [10.0 + i * 0.05 for i in range(n)],
+            "volume": [5000] * n,
+            "turn": [1.0] * n,
+            "pctChg": [0.5] * n,
+        })
+
+    def _make_daily_df(self, n: int = 100) -> pd.DataFrame:
+        dates = pd.bdate_range("2025-01-06", periods=n)
+        return pd.DataFrame({
+            "date": dates,
+            "open": [10.0] * n,
+            "high": [11.0] * n,
+            "low": [9.0] * n,
+            "close": [10.0 + i * 0.01 for i in range(n)],
+            "volume": [5000] * n,
+            "turn": [1.0] * n,
+            "pctChg": [0.5] * n,
+        })
+
+    def _make_context(self) -> StrategyContext:
+        return StrategyContext(
+            now=datetime(2025, 5, 9, 23, 59, 59),
+            stock_pool=[],
+            config={},
+        )
+
+    def test_scan_accepts_precomputed_weekly_no_type_error(self):
+        """scan() must not raise TypeError when called with precomputed_weekly kwarg."""
+        from strategies.momentum_reversal_13 import MomentumReversal13Strategy
+        strategy = MomentumReversal13Strategy({})
+        weekly = self._make_weekly_df(20)
+        daily = self._make_daily_df()
+        ctx = self._make_context()
+
+        # Must not raise — this is the exact call the replay loop makes
+        result = strategy.scan("sh.600000", daily, ctx, precomputed_weekly=weekly)
+        assert result is not None
+        assert hasattr(result, "matched")
+
+    def test_scan_with_precomputed_weekly_skips_get_completed_weekly_bars(self):
+        """When precomputed_weekly is provided, get_completed_weekly_bars must
+        not be called — the strategy uses the pre-sliced data directly."""
+        from strategies.momentum_reversal_13 import MomentumReversal13Strategy
+        strategy = MomentumReversal13Strategy({})
+        weekly = self._make_weekly_df(20)
+        daily = self._make_daily_df()
+        ctx = self._make_context()
+
+        with patch("strategies.momentum_reversal_13.get_completed_weekly_bars") as mock_gcwb:
+            strategy.scan("sh.600000", daily, ctx, precomputed_weekly=weekly)
+            mock_gcwb.assert_not_called()
+
+    def test_scan_without_precomputed_weekly_calls_get_completed_weekly_bars(self):
+        """When precomputed_weekly is None (default), get_completed_weekly_bars
+        must still be called — the normal scanner path is unchanged."""
+        from strategies.momentum_reversal_13 import MomentumReversal13Strategy
+        strategy = MomentumReversal13Strategy({})
+        daily = self._make_daily_df()
+        ctx = self._make_context()
+
+        with patch("strategies.momentum_reversal_13.get_completed_weekly_bars",
+                   return_value=self._make_weekly_df(20)) as mock_gcwb:
+            strategy.scan("sh.600000", daily, ctx)
+            mock_gcwb.assert_called_once()
+

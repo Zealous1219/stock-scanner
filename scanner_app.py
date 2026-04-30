@@ -13,7 +13,7 @@ import baostock as bs
 import pandas as pd
 
 from config_loader import load_config
-from data_utils import ensure_daily_frame
+from data_utils import ensure_daily_frame, get_last_trading_day_of_week
 from strategy_runtime import StrategyContext, StrategyDecision, StrategyResult
 from strategies import create_strategy_from_config
 
@@ -494,11 +494,12 @@ def load_full_df_for_replay(
 def generate_weekly_snapshot_dates(lookback_weeks: int) -> List[datetime]:
     """Generate exactly ``lookback_weeks`` completed Friday snapshot dates.
 
-    Each snapshot represents the moment after a *completed* Friday trading
-    week.  The current week is excluded when it has not yet finished (Friday
-    before 20:00).  Every included Friday is anchored at 23:59:59 so that
-    the weekly cutoff logic in get_last_completed_week_end sees hour >= 20
-    consistently, regardless of when the replay is actually run.
+    Each snapshot represents the moment after a *completed* weekly trading
+    week.  The current week is excluded when its last trading day has not
+    yet passed (or on that day before 20:00).  Every included Friday is
+    anchored at 23:59:59 so that the weekly cutoff logic in
+    get_last_completed_week_end sees hour >= 20 consistently, regardless
+    of when the replay is actually run.
 
     The date list is built by decrementing from the last completed Friday:
     this guarantees that ``lookback_weeks=N`` produces exactly N snapshots
@@ -513,20 +514,42 @@ def generate_weekly_snapshot_dates(lookback_weeks: int) -> List[datetime]:
     today = now.date()
     weekday = now.weekday()
 
-    # Last Friday whose trading week is known to be completed.
-    # Mon-Thu:          last week's Friday
-    # Fri before 20:00: last week's Friday (current week not yet finished)
-    # Fri after 20:00:  this Friday
-    # Sat / Sun:        this week's Friday (just passed)
+    # 1. Determine this week's Friday anchor (natural week)
     if weekday < 4:  # Monday - Thursday
-        last_completed_friday = today - timedelta(days=weekday + 3)
+        this_friday_anchor = today + timedelta(days=4 - weekday)
     elif weekday == 4:  # Friday
-        if now.hour < 20:
-            last_completed_friday = today - timedelta(days=7)
-        else:
-            last_completed_friday = today
+        this_friday_anchor = today
     else:  # Saturday (5) or Sunday (6)
-        last_completed_friday = today - timedelta(days=weekday - 4)
+        this_friday_anchor = today - timedelta(days=weekday - 4)
+
+    # 2. Query the last trading day of this week using the trading calendar
+    last_trading_day = None
+    try:
+        last_trading_day = get_last_trading_day_of_week(pd.Timestamp(today))
+    except Exception:
+        # Any unexpected exception from the calendar query is treated as
+        # a failure — we fall back conservatively below.
+        pass
+
+    # 3. Decide whether this week is completed
+    if last_trading_day is None:
+        # Calendar query failed — be conservative and fall back to the
+        # previous Friday anchor.
+        last_completed_friday = this_friday_anchor - timedelta(weeks=1)
+    else:
+        last_trading_date = last_trading_day.date()
+        if today < last_trading_date:
+            # Current date is before the last trading day of this week
+            last_completed_friday = this_friday_anchor - timedelta(weeks=1)
+        elif today > last_trading_date:
+            # Current date is after the last trading day of this week
+            last_completed_friday = this_friday_anchor
+        else:
+            # today == last_trading_date
+            if now.hour < 20:
+                last_completed_friday = this_friday_anchor - timedelta(weeks=1)
+            else:
+                last_completed_friday = this_friday_anchor
 
     # Build exactly lookback_weeks snapshots by decrementing from the last
     # completed Friday.  Decrementing by whole weeks guarantees we always
@@ -933,6 +956,73 @@ def save_replay_checkpoint(
         json.dump(checkpoint, f, ensure_ascii=True, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Weekly-strategy replay optimization v1
+#
+# These helpers exist exclusively for the weekly-strategy replay path.
+# They pre-compute a full weekly bar series once per symbol so that the
+# inner snapshot loop only needs a cheap cutoff slice instead of a full
+# daily→weekly resample on every snapshot.
+#
+# Why only weekly strategies?
+#   Daily-bar strategies (e.g. moving_average) consume the daily slice
+#   directly and have no equivalent "resample once, slice many times"
+#   opportunity.  If daily-strategy replay ever needs acceleration, it
+#   should get its own daily-specific precompute path rather than reusing
+#   this weekly cache.
+#
+# Why this doesn't change completed-week semantics:
+#   The full weekly series is built with convert_daily_to_weekly(full_df)
+#   — no cutoff applied yet.  The per-snapshot cutoff is applied by
+#   slice_weekly_bars_for_snapshot, which mirrors exactly what
+#   get_completed_weekly_bars does: it truncates at the last completed
+#   Friday anchor for the given snapshot_date.  The strategy therefore
+#   sees the same weekly bars it would have seen without the cache.
+# ---------------------------------------------------------------------------
+
+# Strategies that consume completed weekly bars and can benefit from the
+# weekly precompute cache.  Non-weekly strategies are NOT in this set and
+# will continue to use the standard daily-slice path.
+_WEEKLY_REPLAY_STRATEGIES = frozenset({"momentum_reversal_13", "black_horse"})
+
+
+def precompute_weekly_bars_for_replay(full_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a complete Friday-anchored weekly bar series from full daily data.
+
+    Called once per symbol before the snapshot loop.  The result is stored
+    in weekly_full_cache and sliced per snapshot by
+    slice_weekly_bars_for_snapshot.
+
+    No cutoff is applied here — the full history is kept so that any
+    snapshot date can be served from this single precomputed series.
+    """
+    from data_utils import convert_daily_to_weekly
+    return convert_daily_to_weekly(full_df, cutoff_date=None)
+
+
+def slice_weekly_bars_for_snapshot(
+    weekly_full: pd.DataFrame,
+    snapshot_date: datetime,
+) -> pd.DataFrame:
+    """Return completed weekly bars visible at snapshot_date.
+
+    Mirrors the cutoff logic of get_completed_weekly_bars:
+    - snapshot_date carries hour=23:59:59 (set by generate_weekly_snapshot_dates)
+    - That means it is always a Friday after 20:00, so the completed-week
+      anchor is this Friday itself (not the previous one).
+    - We keep all weekly bars whose date <= snapshot_date's Friday anchor.
+
+    This is semantically equivalent to calling get_completed_weekly_bars
+    on the daily slice, but avoids the resample on every snapshot.
+    """
+    if weekly_full.empty:
+        return weekly_full
+
+    # snapshot_date is a Friday at 23:59:59 — the Friday anchor IS snapshot_date.date()
+    friday_anchor = pd.Timestamp(snapshot_date.date())
+    return weekly_full[weekly_full["date"] <= friday_anchor].copy()
+
+
 def run_weekly_replay_validation(resume: bool = True) -> None:
     """Run weekly historical replay validation for the last lookback_weeks.
 
@@ -1061,6 +1151,13 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 os.remove(checkpoint_path)
 
         full_df_cache: Dict[str, pd.DataFrame | None] = {}
+        # Weekly-strategy replay optimization v1:
+        # Pre-computed full weekly bar series, keyed by symbol.
+        # Built once per symbol from full_df; each snapshot slices it cheaply.
+        # Only populated when the strategy is in _WEEKLY_REPLAY_STRATEGIES.
+        # Daily-strategy replay does not use this cache.
+        weekly_full_cache: Dict[str, pd.DataFrame | None] = {}
+        use_weekly_cache = strategy.name in _WEEKLY_REPLAY_STRATEGIES
         SLOW_SYMBOL_THRESHOLD = 3.0  # seconds — warn if a single symbol exceeds this
 
         for snapshot_idx, snapshot_date in enumerate(weekly_dates, 1):
@@ -1133,6 +1230,16 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         )
                         stage_times["load_full_df"] = time.time() - t0
 
+                        # Weekly-strategy replay optimization v1:
+                        # Pre-compute full weekly bars once per symbol so that
+                        # each snapshot only needs a cheap cutoff slice.
+                        # This is the weekly-specific acceleration path; daily
+                        # strategies do not populate weekly_full_cache.
+                        if use_weekly_cache and full_df_cache[symbol] is not None:
+                            weekly_full_cache[symbol] = precompute_weekly_bars_for_replay(
+                                full_df_cache[symbol]
+                            )
+
                     full_df = full_df_cache[symbol]
 
                     if full_df is None or full_df.empty:
@@ -1154,9 +1261,19 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         processed_count += 1
 
                         # Stage: strategy.scan
+                        # Weekly-strategy replay optimization v1:
+                        # For weekly strategies, pass the pre-sliced weekly bars
+                        # so the strategy skips the daily→weekly resample.
+                        # Non-weekly strategies use the standard call path.
                         t0 = time.time()
                         current_stage = "scan"
-                        result = strategy.scan(symbol, df, context)
+                        if use_weekly_cache and symbol in weekly_full_cache and weekly_full_cache[symbol] is not None:
+                            precomputed_weekly = slice_weekly_bars_for_snapshot(
+                                weekly_full_cache[symbol], snapshot_date
+                            )
+                            result = strategy.scan(symbol, df, context, precomputed_weekly=precomputed_weekly)
+                        else:
+                            result = strategy.scan(symbol, df, context)
                         stage_times["scan"] = time.time() - t0
                         matched = result.matched
 

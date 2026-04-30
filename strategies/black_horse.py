@@ -66,8 +66,22 @@ class BlackHorseStrategy(BaseStrategy):
             "week_3_volume": float(enriched.iloc[2]["volume"]),
         }
 
-    def scan(self, symbol: str, df: pd.DataFrame, context: StrategyContext) -> StrategyResult:
-        weekly = get_completed_weekly_bars(df, now=context.now)
+    def scan(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        context: StrategyContext,
+        precomputed_weekly: pd.DataFrame | None = None,
+    ) -> StrategyResult:
+        # Weekly-strategy replay optimization v1:
+        # If the caller (replay loop) has already pre-sliced the completed
+        # weekly bars for this snapshot, use them directly to skip the
+        # daily→weekly resample.  The normal scanner path passes None and
+        # falls through to the standard get_completed_weekly_bars call.
+        if precomputed_weekly is not None:
+            weekly = precomputed_weekly
+        else:
+            weekly = get_completed_weekly_bars(df, now=context.now)
 
         if len(weekly) < self.min_weekly_bars:
             return StrategyResult(

@@ -406,7 +406,8 @@ class MomentumReversal13Strategy(BaseStrategy):
         return result
 
     def scan(
-        self, symbol: str, df: pd.DataFrame, context: StrategyContext
+        self, symbol: str, df: pd.DataFrame, context: StrategyContext,
+        precomputed_weekly: pd.DataFrame | None = None,
     ) -> StrategyResult:
         """
         单标的完整扫描
@@ -417,12 +418,19 @@ class MomentumReversal13Strategy(BaseStrategy):
             symbol: 股票代码，如 '000001.SZ'
             df: 日线历史数据 DataFrame
             context: 运行时上下文
+            precomputed_weekly: replay weekly cache 路径传入的预切片周线数据。
+                非 None 时直接使用，跳过 get_completed_weekly_bars。
+                普通 scanner 调用不传此参数，保持原有路径不变。
 
         返回值:
             StrategyResult: 包含是否命中、原因码、描述和详情
         """
-        # 获取已完成的周线数据
-        weekly = get_completed_weekly_bars(df, now=context.now)
+        # Weekly-strategy replay optimization v1:
+        # Use pre-sliced weekly bars from the replay cache when available.
+        if precomputed_weekly is not None:
+            weekly = precomputed_weekly
+        else:
+            weekly = get_completed_weekly_bars(df, now=context.now)
 
         if len(weekly) < self.min_weekly_bars:
             return StrategyResult(
