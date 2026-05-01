@@ -1187,6 +1187,19 @@ def save_replay_checkpoint(
 _WEEKLY_REPLAY_STRATEGIES = frozenset({"momentum_reversal_13", "black_horse"})
 
 
+def get_replay_strategy_slug(strategy_name: str) -> str:
+    """Return the stable replay experiment slug for a strategy name.
+
+    ``momentum_reversal_13`` keeps the historical ``mr13`` slug so existing
+    replay checkpoints/results remain resume-compatible. Other strategies use
+    their configured strategy name directly.
+    """
+    legacy_slug_map = {
+        "momentum_reversal_13": "mr13",
+    }
+    return legacy_slug_map.get(strategy_name, strategy_name)
+
+
 def precompute_weekly_bars_for_replay(full_df: pd.DataFrame) -> pd.DataFrame:
     """Build a complete Friday-anchored weekly bar series from full daily data.
 
@@ -1285,7 +1298,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
     - Universe: all A-shares only
     - Time range: most recent lookback_weeks (default 52 weeks)
     - Replay frequency: one run per completed weekly bar
-    - Strategy: momentum_reversal_13 only
+    - Strategy: selected by ``strategy_name`` below
 
     Output: validation/replay/replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv
             (per-snapshot result files, overwritten on re-run)
@@ -1302,11 +1315,12 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
     stock_pool = "all"
     strategy_name = "momentum_reversal_13"
+    strategy_slug = get_replay_strategy_slug(strategy_name)
 
     universe = stock_pool
     lookback_weeks = 52
     version = "v1"
-    experiment_tag = f"mr13_{universe}_{lookback_weeks}w_{version}"
+    experiment_tag = f"{strategy_slug}_{universe}_{lookback_weeks}w_{version}"
 
     config = load_config()
     strategy_config = {

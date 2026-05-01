@@ -8,6 +8,7 @@ import pandas as pd
 
 from scanner_app import (
     calculate_forward_returns,
+    get_replay_strategy_slug,
     should_force_refresh_on_friday,
     load_or_update_data,
     get_latest_trading_day,
@@ -547,3 +548,11 @@ class TestCalculateForwardReturns:
         assert pd.isna(returns["return_4w"])
         assert pd.isna(returns["return_8w"])
         assert pd.isna(returns["return_12w"])
+
+
+class TestReplayStrategySlug:
+    def test_mr13_keeps_legacy_replay_slug(self):
+        assert get_replay_strategy_slug("momentum_reversal_13") == "mr13"
+
+    def test_black_horse_uses_strategy_name_as_replay_slug(self):
+        assert get_replay_strategy_slug("black_horse") == "black_horse"
