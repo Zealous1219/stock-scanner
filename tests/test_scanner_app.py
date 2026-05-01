@@ -505,7 +505,9 @@ class TestCalculateForwardReturns:
         assert pd.isna(returns["return_4w"])
         assert pd.isna(returns["return_8w"])
         assert pd.isna(returns["return_12w"])
-        assert mock_logger.warning.call_count == 3
+        assert pd.isna(returns["return_16w"])
+        assert pd.isna(returns["return_20w"])
+        assert mock_logger.warning.call_count == 5
 
     def test_empty_dataframe_keeps_nan(self):
         empty_df = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
