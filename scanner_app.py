@@ -413,8 +413,14 @@ def load_full_df_for_replay(
     initial_days: int,
     request_interval: float,
     required_history_days: int,
+    replay_data_end_date: str | None = None,
 ) -> pd.DataFrame | None:
     """Load complete, standardized full_df for a stock for replay.
+
+    Args:
+        replay_data_end_date: Fixed end date for replay data (YYYY-MM-DD string).
+            When provided, this replaces datetime.now() as the data boundary,
+            ensuring replay reproducibility across runs.
 
     Returns DataFrame with datetime date column, or None if load failed.
     """
@@ -422,8 +428,16 @@ def load_full_df_for_replay(
     file_path = os.path.join(DATA_DIR, f"{filename}.csv")
 
     history_days = max(initial_days, required_history_days)
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=history_days)).strftime("%Y-%m-%d")
+
+    if replay_data_end_date is not None:
+        end_date_obj = datetime.strptime(replay_data_end_date, "%Y-%m-%d").date()
+        end_date = replay_data_end_date
+        start_date_obj = end_date_obj - timedelta(days=history_days)
+        start_date = start_date_obj.strftime("%Y-%m-%d")
+    else:
+        end_date_obj = datetime.now().date()
+        end_date = end_date_obj.strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=history_days)).strftime("%Y-%m-%d")
 
     if not os.path.exists(file_path):
         df = fetch_historical_data(symbol, start_date, end_date)
@@ -439,9 +453,9 @@ def load_full_df_for_replay(
         local_df = ensure_daily_frame(pd.read_csv(file_path))
         local_df["date"] = pd.to_datetime(local_df["date"])
 
-        earliest_date = local_df["date"].min()
-        required_start = pd.Timestamp(datetime.now() - timedelta(days=history_days))
+        required_start = pd.Timestamp(end_date_obj - timedelta(days=history_days))
 
+        earliest_date = local_df["date"].min()
         if earliest_date > required_start:
             earliest_date_str = earliest_date.strftime("%Y-%m-%d")
             fetch_end = (earliest_date - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -458,8 +472,8 @@ def load_full_df_for_replay(
                     time.sleep(request_interval)
 
         latest_date = local_df["date"].max()
-        today_timestamp = pd.Timestamp(datetime.now().date())
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_timestamp = pd.Timestamp(end_date_obj)
+        today_str = end_date
 
         if latest_date >= today_timestamp:
             return local_df
@@ -879,6 +893,7 @@ def validate_replay_checkpoint(
     lookback_weeks: int,
     version: str,
     expected_snapshot_dates: List[str],
+    expected_replay_data_end_date: str | None = None,
 ) -> List[str]:
     """Validate checkpoint identity and return completed snapshots.
 
@@ -889,6 +904,10 @@ def validate_replay_checkpoint(
     that a checkpoint created during an earlier run with a *different*
     snapshot window is never mistaken for the same experiment.  This
     prevents silently merging results from two different time windows.
+
+    The ``replay_data_end_date`` is validated to ensure the same data
+    boundary is used across resume runs, preventing data drift when
+    the replay is resumed on a different day.
     """
     expected_fields = {
         "experiment_tag": experiment_tag,
@@ -943,6 +962,27 @@ def validate_replay_checkpoint(
             "Cannot safely resume — these are different snapshot windows."
         )
 
+    # Validate replay_data_end_date: the data boundary must be identical
+    # between the checkpoint and the current run to ensure reproducibility.
+    checkpoint_replay_data_end_date = checkpoint.get("replay_data_end_date")
+    if checkpoint_replay_data_end_date is None:
+        raise RuntimeError(
+            "Replay checkpoint is missing 'replay_data_end_date'. "
+            "The checkpoint schema is insufficient to verify that the "
+            "data boundary is identical to the current run. "
+            "This is required for replay reproducibility. "
+            "Cannot safely resume — please delete the checkpoint or "
+            "run a fresh replay with the new schema."
+        )
+    if expected_replay_data_end_date is not None:
+        if checkpoint_replay_data_end_date != expected_replay_data_end_date:
+            raise RuntimeError(
+                "Replay checkpoint 'replay_data_end_date' does not match the current run. "
+                f"Checkpoint: {checkpoint_replay_data_end_date}. "
+                f"Current run: {expected_replay_data_end_date}. "
+                "Cannot safely resume — the data boundary has changed."
+            )
+
     completed_snapshots = checkpoint.get("completed_snapshots")
     if not isinstance(completed_snapshots, list) or any(not isinstance(item, str) for item in completed_snapshots):
         raise RuntimeError("Replay checkpoint has invalid completed_snapshots; expected a list of YYYY-MM-DD strings")
@@ -958,12 +998,17 @@ def save_replay_checkpoint(
     version: str,
     completed_snapshots: List[str],
     snapshot_dates: List[str],
+    replay_data_end_date: str | None = None,
 ) -> None:
     """Persist replay checkpoint JSON for snapshot-level resume.
 
     ``snapshot_dates`` encodes the full snapshot window identity so that
     a future resume can verify that it is resuming the *same* window,
     not a different window generated weeks later.
+
+    ``replay_data_end_date`` fixes the data boundary for replay so that
+    the same experiment always uses identical data, regardless of when
+    the replay is resumed.
     """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     checkpoint: Dict[str, Any] = {
@@ -976,9 +1021,14 @@ def save_replay_checkpoint(
         "updated_at": now_str,
     }
 
+    if replay_data_end_date is not None:
+        checkpoint["replay_data_end_date"] = replay_data_end_date
+
     if os.path.exists(checkpoint_path):
         existing_checkpoint = load_replay_checkpoint(checkpoint_path)
         checkpoint["created_at"] = existing_checkpoint.get("created_at", now_str)
+        if "replay_data_end_date" not in checkpoint and "replay_data_end_date" in existing_checkpoint:
+            checkpoint["replay_data_end_date"] = existing_checkpoint["replay_data_end_date"]
     else:
         checkpoint["created_at"] = now_str
 
@@ -1175,16 +1225,26 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         # checkpoint so future resumes can verify they target the same window.
         snapshot_dates_str = [d.strftime("%Y-%m-%d") for d in weekly_dates]
 
+        # Calculate fixed replay_data_end_date: the data boundary for this replay experiment.
+        # This ensures the same data is used regardless of when the replay is resumed.
+        # Use last snapshot + 21 weeks (20 weeks max forward return + 1 week buffer).
+        last_snapshot_date = max(weekly_dates).date()
+        replay_data_end_date = (last_snapshot_date + timedelta(weeks=21)).strftime("%Y-%m-%d")
+        logger.info("Replay data end date (fixed): %s", replay_data_end_date)
+
         replay_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}.csv")
         error_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}_errors.csv")
         checkpoint_path = get_replay_checkpoint_path(universe, lookback_weeks, version)
 
         completed_snapshots: List[str] = []
         run_mode = "fresh"
+        resume_replay_data_end_date = None
 
         if resume and os.path.exists(checkpoint_path):
             logger.info("[Replay] Checkpoint detected: %s", checkpoint_path)
             checkpoint = load_replay_checkpoint(checkpoint_path)
+
+            # Validate checkpoint and get completed snapshots
             completed_snapshots = validate_replay_checkpoint(
                 checkpoint,
                 experiment_tag,
@@ -1192,7 +1252,22 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 lookback_weeks,
                 version,
                 snapshot_dates_str,
+                expected_replay_data_end_date=replay_data_end_date,
             )
+
+            # Use the replay_data_end_date from checkpoint for resume
+            resume_replay_data_end_date = checkpoint.get("replay_data_end_date")
+            if resume_replay_data_end_date is None:
+                raise RuntimeError(
+                    "Replay checkpoint is missing 'replay_data_end_date'. "
+                    "The checkpoint schema is insufficient to verify that the "
+                    "data boundary is identical to the current run. "
+                    "Cannot safely resume — please delete the checkpoint or "
+                    "run a fresh replay with the new schema."
+                )
+            # For resume, use the checkpoint's value to ensure consistency
+            replay_data_end_date = resume_replay_data_end_date
+            logger.info("[Replay] Resume with replay_data_end_date: %s", replay_data_end_date)
 
             if not os.path.exists(replay_file):
                 raise RuntimeError(
@@ -1289,6 +1364,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 save_replay_checkpoint(
                     checkpoint_path, experiment_tag, universe, lookback_weeks, version,
                     completed_snapshots.copy(), snapshot_dates_str,
+                    replay_data_end_date=replay_data_end_date,
                 )
                 continue
 
@@ -1324,7 +1400,8 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         t0 = time.time()
                         current_stage = "load_full_df"
                         full_df_cache[symbol] = load_full_df_for_replay(
-                            symbol, lookback_days, initial_days, request_interval, required_history_days
+                            symbol, lookback_days, initial_days, request_interval, required_history_days,
+                            replay_data_end_date=replay_data_end_date,
                         )
                         stage_times["load_full_df"] = time.time() - t0
 
@@ -1474,6 +1551,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 version,
                 completed_snapshots.copy(),
                 snapshot_dates_str,
+                replay_data_end_date=replay_data_end_date,
             )
 
         logger.info("Weekly replay validation completed.")

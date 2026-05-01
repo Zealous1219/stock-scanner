@@ -1014,6 +1014,7 @@ class TestReplayCheckpointResume:
             "version": "v1",
             "snapshot_dates": ["2025-05-02", "2025-05-09", "2025-05-16"],
             "completed_snapshots": ["2025-05-02", "2025-05-09"],
+            "replay_data_end_date": "2025-10-10",  # 2025-05-16 + 21 weeks = 2025-10-10
         }
 
         strategy = MagicMock()
@@ -1075,6 +1076,7 @@ class TestReplayCheckpointResume:
             "version": "v1",
             "snapshot_dates": ["2025-05-02", "2025-05-09"],
             "completed_snapshots": ["2025-05-02"],
+            "replay_data_end_date": "2025-10-03",  # 2025-05-09 + 21 weeks (adjusted for test)
         }
 
         def exists_side_effect(path):
@@ -1097,6 +1099,7 @@ class TestReplayCheckpointResume:
             "version": "v1",
             "snapshot_dates": ["2025-05-02", "2025-05-09"],
             "completed_snapshots": [],
+            "replay_data_end_date": "2025-10-03",  # 2025-05-09 + 21 weeks
         }):
             try:
                 run_weekly_replay_validation()
@@ -1150,6 +1153,7 @@ class TestReplayCheckpointResume:
             "version": "v1",
             "snapshot_dates": ["2025-05-02"],
             "completed_snapshots": ["2025-05-02"],
+            "replay_data_end_date": "2025-10-10",  # Add to avoid missing schema error
         }
 
         def exists_side_effect(path):
@@ -1370,6 +1374,7 @@ class TestReplayCheckpointResume:
             "version": "v1",
             "snapshot_dates": ["2025-05-02", "2025-05-09", "2025-05-16"],
             "completed_snapshots": ["2025-05-02", "2025-05-09", "2025-05-16"],
+            "replay_data_end_date": "2025-10-10",  # 2025-05-16 + 21 weeks
         }
 
         def exists_side_effect_resume(path):
@@ -1825,6 +1830,7 @@ class TestSnapshotWindowIdentity:
             "version": "v1",
             "snapshot_dates": ["2025-05-02", "2025-05-09", "2025-05-16"],
             "completed_snapshots": ["2025-05-02"],
+            "replay_data_end_date": "2025-10-10",  # 2025-05-16 + 21 weeks
         }
 
         strategy = MagicMock()
@@ -2736,4 +2742,9 @@ class TestWeeklyReplayCompletenessGuard:
                 standard = get_completed_weekly_bars(daily_slice, now=sc["snapshot"])
 
             self._assert_identical(sliced, standard)
+
+
+# replay_data_end_date tests have been moved to test_replay_data_end_date.py
+# to avoid mock issues in this file.
+
 
