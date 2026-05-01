@@ -7,11 +7,13 @@ import pytest
 import pandas as pd
 
 from scanner_app import (
+    calculate_forward_returns,
     should_force_refresh_on_friday,
     load_or_update_data,
     get_latest_trading_day,
     get_stock_list,
 )
+from strategy_runtime import StrategyResult
 
 
 class TestShouldForceRefreshOnFriday:
@@ -430,3 +432,86 @@ class TestGetStockList:
         """不支持的股票池抛出异常"""
         with pytest.raises(ValueError, match="Unsupported stock pool"):
             get_stock_list("unknown")
+class TestCalculateForwardReturns:
+    """Test forward return target-date matching."""
+
+    @staticmethod
+    def _make_result(signal_date: str = "2025-01-03") -> StrategyResult:
+        return StrategyResult(
+            matched=True,
+            reason_code="matched",
+            reason_text="matched",
+            details={"signal_date": signal_date},
+        )
+
+    @staticmethod
+    def _make_df(rows: list[tuple[str, float]]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "date": [row[0] for row in rows],
+                "open": [price for _, price in rows],
+                "high": [price for _, price in rows],
+                "low": [price for _, price in rows],
+                "close": [price for _, price in rows],
+                "volume": [1000] * len(rows),
+            }
+        )
+
+    def test_exact_target_date_uses_exact_match(self):
+        df = self._make_df(
+            [
+                ("2025-01-03", 100.0),
+                ("2025-01-31", 110.0),
+                ("2025-02-28", 120.0),
+                ("2025-03-28", 130.0),
+            ]
+        )
+
+        returns = calculate_forward_returns("sh.600000", self._make_result(), full_df=df)
+
+        assert returns["return_4w"] == pytest.approx(0.10)
+        assert returns["return_8w"] == pytest.approx(0.20)
+        assert returns["return_12w"] == pytest.approx(0.30)
+
+    def test_within_three_day_gap_uses_nearest_trading_day(self):
+        df = self._make_df(
+            [
+                ("2025-01-03", 100.0),
+                ("2025-01-30", 108.0),
+                ("2025-03-03", 121.0),
+                ("2025-03-31", 133.0),
+            ]
+        )
+
+        returns = calculate_forward_returns("sh.600000", self._make_result(), full_df=df)
+
+        assert returns["return_4w"] == pytest.approx(0.08)
+        assert returns["return_8w"] == pytest.approx(0.21)
+        assert returns["return_12w"] == pytest.approx(0.33)
+
+    @patch("scanner_app.logger")
+    def test_gap_beyond_three_days_keeps_nan_and_warns(self, mock_logger):
+        df = self._make_df(
+            [
+                ("2025-01-03", 100.0),
+                ("2025-02-10", 115.0),
+                ("2025-03-10", 125.0),
+                ("2025-04-10", 135.0),
+            ]
+        )
+
+        returns = calculate_forward_returns("sh.600000", self._make_result(), full_df=df)
+
+        assert pd.isna(returns["return_4w"])
+        assert pd.isna(returns["return_8w"])
+        assert pd.isna(returns["return_12w"])
+        assert mock_logger.warning.call_count == 3
+
+    def test_empty_dataframe_keeps_nan(self):
+        empty_df = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+        returns = calculate_forward_returns("sh.600000", self._make_result(), full_df=empty_df)
+
+        assert pd.isna(returns["return_4w"])
+        assert pd.isna(returns["return_8w"])
+        assert pd.isna(returns["return_12w"])

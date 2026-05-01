@@ -16,7 +16,7 @@ from scanner_app import main as scanner_main
 # Set to None to use config.json values.
 #默认保持None，仅用于临时调试
 STOCK_POOL = None  # hs300 | zz500 | sz50 | all | None
-STRATEGY_NAME = None  # black_horse | moving_average | None
+STRATEGY_NAME = 'black_horse'  # black_horse | moving_average | None
 
 
 def apply_local_overrides() -> None:

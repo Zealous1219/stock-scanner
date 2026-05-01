@@ -657,7 +657,10 @@ def calculate_forward_returns(
         "return_4w": float("nan"),
         "return_8w": float("nan"),
         "return_12w": float("nan"),
+        "return_16w": float("nan"),
+        "return_20w": float("nan"),
     }
+    max_gap_days = 3
 
     signal_date_str = result.details.get("signal_date", "")
     if not signal_date_str:
@@ -670,6 +673,8 @@ def calculate_forward_returns(
             "4w": signal_date + timedelta(weeks=4),
             "8w": signal_date + timedelta(weeks=8),
             "12w": signal_date + timedelta(weeks=12),
+            "16w": signal_date + timedelta(weeks=16),
+            "20w": signal_date + timedelta(weeks=20),
         }
 
         if full_df is not None:
@@ -694,11 +699,30 @@ def calculate_forward_returns(
         signal_close = float(signal_data.iloc[0]["close"])
 
         for period, future_date in future_dates.items():
-            future_data = df[df["date"] >= pd.Timestamp(future_date)]
-            if future_data.empty:
-                continue
+            target_ts = pd.Timestamp(future_date)
+            exact_match = df[df["date"] == target_ts]
 
-            future_row = future_data.iloc[0]
+            if not exact_match.empty:
+                future_row = exact_match.iloc[0]
+            elif df.empty:
+                continue
+            else:
+                date_deltas = (df["date"] - target_ts).abs()
+                nearest_idx = date_deltas.idxmin()
+                nearest_gap = date_deltas.loc[nearest_idx]
+
+                if pd.isna(nearest_gap) or nearest_gap > pd.Timedelta(days=max_gap_days):
+                    logger.warning(
+                        "%s %s forward return target %s has no trading day within %d days; keeping NaN",
+                        symbol,
+                        period,
+                        target_ts.strftime("%Y-%m-%d"),
+                        max_gap_days,
+                    )
+                    continue
+
+                future_row = df.loc[nearest_idx]
+
             future_close = float(future_row["close"])
 
             returns = (future_close - signal_close) / signal_close
@@ -709,6 +733,10 @@ def calculate_forward_returns(
                 forward_returns["return_8w"] = returns
             elif period == "12w":
                 forward_returns["return_12w"] = returns
+            elif period == "16w":
+                forward_returns["return_16w"] = returns
+            elif period == "20w":
+                forward_returns["return_20w"] = returns
 
     except Exception as exc:
         logger.debug("计算%s前向收益率失败: %s", symbol, exc)
@@ -765,6 +793,8 @@ def build_replay_record(
         "forward_4w_return": forward_returns.get("return_4w", float("nan")),
         "forward_8w_return": forward_returns.get("return_8w", float("nan")),
         "forward_12w_return": forward_returns.get("return_12w", float("nan")),
+        "forward_16w_return": forward_returns.get("return_16w", float("nan")),
+        "forward_20w_return": forward_returns.get("return_20w", float("nan")),
     }
 
     return record
