@@ -2320,7 +2320,12 @@ class TestWeeklyReplayHelpers:
 
         # Path A: precompute + slice (new optimization path)
         weekly_full = precompute_weekly_bars_for_replay(daily)
-        sliced = slice_weekly_bars_for_snapshot(weekly_full, snapshot)
+        # Pass the snapshot week's last trading day so the completeness guard
+        # keeps the bar (this is a normal 5-day week, data is complete).
+        sliced = slice_weekly_bars_for_snapshot(
+            weekly_full, snapshot,
+            snapshot_week_last_trading_day=pd.Timestamp("2025-03-28"),
+        )
 
         # Path B: standard path — filter daily to cutoff, then get_completed_weekly_bars.
         # Mock get_last_trading_day_of_week so it returns the Friday itself (normal week),
@@ -2432,4 +2437,303 @@ class TestMR13PrecomputedWeeklyCompat:
                    return_value=self._make_weekly_df(20)) as mock_gcwb:
             strategy.scan("sh.600000", daily, ctx)
             mock_gcwb.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Weekly replay cache completeness guard — symbol-level data-integrity tests
+#
+# These tests verify that slice_weekly_bars_for_snapshot NEVER produces a
+# "half-week" phantom bar for the current snapshot week when the symbol's
+# full_df does not contain all trading days through the week's last trading
+# day.  The cache path must be no looser than the standard
+# get_completed_weekly_bars path.
+# ---------------------------------------------------------------------------
+
+class TestWeeklyReplayCompletenessGuard:
+    """Verify that slice_weekly_bars_for_snapshot enforces symbol-level
+    completed-week data-integrity via the new trading_days_count and
+    last_daily_date fields."""
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _daily_with_last_week_partial(
+        start: str = "2025-01-06",
+        full_weeks: int = 8,
+        last_week_dates: list | None = None,
+    ) -> pd.DataFrame:
+        """Build a daily DataFrame with `full_weeks` complete Mon-Fri weeks
+        plus a partial final week specified by `last_week_dates` (list of
+        date strings or timestamps)."""
+        full_dates = pd.bdate_range(start=start, periods=full_weeks * 5)
+        rows = []
+        for d in full_dates:
+            rows.append({
+                "date": d,
+                "open": 10.0,
+                "high": 10.5,
+                "low": 9.5,
+                "close": 10.0,
+                "volume": 1000,
+            })
+        if last_week_dates:
+            for d in last_week_dates:
+                rows.append({
+                    "date": pd.Timestamp(d),
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.5,
+                    "close": 10.0,
+                    "volume": 1000,
+                })
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").reset_index(drop=True)
+
+    @staticmethod
+    def _last_bar_date(weekly: pd.DataFrame) -> pd.Timestamp | None:
+        if weekly.empty:
+            return None
+        return pd.Timestamp(weekly["date"].iloc[-1])
+
+    @staticmethod
+    def _assert_identical(sliced: pd.DataFrame, standard: pd.DataFrame):
+        """Assert two weekly DataFrames are identical in content and shape."""
+        assert len(sliced) == len(standard), (
+            f"Row count mismatch: sliced={len(sliced)}, standard={len(standard)}"
+        )
+        if not sliced.empty and not standard.empty:
+            pd.testing.assert_frame_equal(
+                sliced.reset_index(drop=True),
+                standard.reset_index(drop=True),
+                check_dtype=False,
+            )
+
+    # -- test cases -------------------------------------------------------
+
+    def test_normal_complete_week_includes_snapshot_bar_and_matches_standard(self):
+        """Normal 5-day week with full daily data: cache path must include
+        the snapshot-week bar and produce identical results to the standard
+        get_completed_weekly_bars path."""
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        from data_utils import get_completed_weekly_bars
+
+        # 10 full Mon-Fri weeks ending 2025-03-14 (Friday)
+        daily = self._daily_with_last_week_partial(
+            start="2025-01-06", full_weeks=10, last_week_dates=None,
+        )
+        snapshot = datetime(2025, 3, 14, 23, 59, 59)
+        cutoff_ts = pd.Timestamp(snapshot.date())
+
+        # Cache path
+        weekly_full = precompute_weekly_bars_for_replay(daily)
+        sliced = slice_weekly_bars_for_snapshot(
+            weekly_full, snapshot,
+            snapshot_week_last_trading_day=pd.Timestamp("2025-03-14"),
+        )
+
+        # Standard path (mock calendar so it returns the Friday itself)
+        daily_slice = daily[pd.to_datetime(daily["date"]) <= cutoff_ts].copy()
+        with patch("data_utils.get_last_trading_day_of_week", return_value=pd.Timestamp("2025-03-14")):
+            standard = get_completed_weekly_bars(daily_slice, now=snapshot)
+
+        # Both must include the snapshot-week bar (2025-03-14)
+        assert self._last_bar_date(sliced) == pd.Timestamp("2025-03-14")
+        assert self._last_bar_date(standard) == pd.Timestamp("2025-03-14")
+        self._assert_identical(sliced, standard)
+
+    def test_holiday_short_week_thursday_last_trading_day_keeps_bar(self):
+        """Week where Friday is a holiday (last trading day = Thursday) and
+        symbol data reaches Thursday: cache path must keep the bar and
+        match the standard path."""
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        from data_utils import get_completed_weekly_bars
+
+        snapshot = datetime(2025, 5, 2, 23, 59, 59)  # Friday, but May 1-2 are holidays
+        cutoff_ts = pd.Timestamp(snapshot.date())
+
+        # 8 full weeks + final week Mon-Thu only (no Friday — holiday)
+        daily = self._daily_with_last_week_partial(
+            start="2025-03-03", full_weeks=8,
+            last_week_dates=["2025-04-28", "2025-04-29", "2025-04-30"],
+        )
+
+        weekly_full = precompute_weekly_bars_for_replay(daily)
+        sliced = slice_weekly_bars_for_snapshot(
+            weekly_full, snapshot,
+            snapshot_week_last_trading_day=pd.Timestamp("2025-04-30"),  # Thursday
+        )
+
+        daily_slice = daily[pd.to_datetime(daily["date"]) <= cutoff_ts].copy()
+        with patch("data_utils.get_last_trading_day_of_week", return_value=pd.Timestamp("2025-04-30")):
+            standard = get_completed_weekly_bars(daily_slice, now=snapshot)
+
+        assert self._last_bar_date(sliced) == pd.Timestamp("2025-05-02")  # Friday anchor
+        assert self._last_bar_date(standard) == pd.Timestamp("2025-05-02")
+        self._assert_identical(sliced, standard)
+
+    def test_normal_week_data_only_to_wednesday_drops_snapshot_bar(self):
+        """Full-trading-week but symbol's full_df only contains Mon-Wed:
+        cache path must NOT include a half-week "phantom" bar anchored at
+        Friday."""
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        from data_utils import get_completed_weekly_bars
+
+        snapshot = datetime(2025, 3, 14, 23, 59, 59)
+        cutoff_ts = pd.Timestamp(snapshot.date())
+
+        daily = self._daily_with_last_week_partial(
+            start="2025-01-06", full_weeks=9,
+            last_week_dates=["2025-03-10", "2025-03-11", "2025-03-12"],
+        )
+
+        weekly_full = precompute_weekly_bars_for_replay(daily)
+        sliced = slice_weekly_bars_for_snapshot(
+            weekly_full, snapshot,
+            snapshot_week_last_trading_day=pd.Timestamp("2025-03-14"),  # Friday
+        )
+
+        # Cache path must NOT include the 2025-03-14 bar
+        assert self._last_bar_date(sliced) != pd.Timestamp("2025-03-14"), (
+            "Cache path must drop half-week phantom bar for incomplete data"
+        )
+
+        # Standard path: should also drop the bar since data doesn't reach last trading day
+        daily_slice = daily[pd.to_datetime(daily["date"]) <= cutoff_ts].copy()
+        with patch("data_utils.get_last_trading_day_of_week", return_value=pd.Timestamp("2025-03-14")):
+            standard = get_completed_weekly_bars(daily_slice, now=snapshot)
+
+        self._assert_identical(sliced, standard)
+
+    def test_short_week_with_only_2_trading_days_drops_bar(self):
+        """Week with a holiday-shortened schedule (only 2 trading days)
+        AND data covers both days: trading_days_count=2 < 3 threshold
+        forces the bar to be dropped.
+
+        Note: the standard path (get_completed_weekly_bars) does NOT have
+        a trading_days_count guard, so it may still include the bar.
+        The cache path may be *stricter* but must never be *looser*.
+        """
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        from data_utils import get_completed_weekly_bars
+
+        snapshot = datetime(2025, 10, 3, 23, 59, 59)  # National Day week
+        cutoff_ts = pd.Timestamp(snapshot.date())
+
+        # Only Mon (Sep 29) and Tue (Sep 30) — Wed–Fri are holidays
+        daily = self._daily_with_last_week_partial(
+            start="2025-07-28", full_weeks=8,
+            last_week_dates=["2025-09-29", "2025-09-30"],
+        )
+
+        weekly_full = precompute_weekly_bars_for_replay(daily)
+        sliced = slice_weekly_bars_for_snapshot(
+            weekly_full, snapshot,
+            snapshot_week_last_trading_day=pd.Timestamp("2025-09-30"),
+        )
+
+        # Cache path must drop the bar: trading_days_count=2 < 3
+        assert self._last_bar_date(sliced) != pd.Timestamp("2025-10-03"), (
+            "Cache path must drop bar when trading_days_count < 3"
+        )
+
+        # Verify cache path is NOT looser than standard path:
+        # the standard path may include bars the cache path drops,
+        # but the cache path must never include bars the standard
+        # path does not.
+        daily_slice = daily[pd.to_datetime(daily["date"]) <= cutoff_ts].copy()
+        with patch("data_utils.get_last_trading_day_of_week", return_value=pd.Timestamp("2025-09-30")):
+            standard = get_completed_weekly_bars(daily_slice, now=snapshot)
+
+        standard_dates = set(pd.to_datetime(standard["date"]))
+        sliced_dates = set(pd.to_datetime(sliced["date"]))
+        extra_in_cache = sliced_dates - standard_dates
+        assert not extra_in_cache, (
+            f"Cache path is looser than standard path! Extra bars: {extra_in_cache}"
+        )
+
+    def test_calendar_query_failure_drops_snapshot_bar_conservatively(self):
+        """When the trading calendar query fails (last_trading_day=None),
+        the cache path must conservatively drop the snapshot-week bar."""
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+
+        daily = self._daily_with_last_week_partial(
+            start="2025-01-06", full_weeks=10, last_week_dates=None,
+        )
+        snapshot = datetime(2025, 3, 14, 23, 59, 59)
+
+        weekly_full = precompute_weekly_bars_for_replay(daily)
+        sliced = slice_weekly_bars_for_snapshot(
+            weekly_full, snapshot,
+            snapshot_week_last_trading_day=None,  # calendar failure
+        )
+
+        assert self._last_bar_date(sliced) != pd.Timestamp("2025-03-14"), (
+            "Calendar failure must conservatively drop snapshot-week bar"
+        )
+
+    def test_cross_path_comparison_varied_scenarios(self):
+        """For the same daily data, the precompute+slice cache path and the
+        standard get_completed_weekly_bars path must produce identical
+        results across varied scenarios:
+          - normal complete week at snapshot
+          - holiday-shortened week with sufficient data
+          - partial data (Mon-Wed) in a normal week
+        """
+        from scanner_app import precompute_weekly_bars_for_replay, slice_weekly_bars_for_snapshot
+        from data_utils import get_completed_weekly_bars
+
+        scenarios = [
+            # (label, start, full_weeks, last_week_dates, snapshot,
+            #  last_trading_day_mock, snapshot_week_last_trading_day)
+            {
+                "label": "normal complete week",
+                "start": "2025-01-06",
+                "full_weeks": 10,
+                "last_week_dates": None,
+                "snapshot": datetime(2025, 3, 14, 23, 59, 59),
+                "last_trading_day_mock": pd.Timestamp("2025-03-14"),
+                "snapshot_week_last_trading_day": pd.Timestamp("2025-03-14"),
+            },
+            {
+                "label": "holiday Thursday close",
+                "start": "2025-03-03",
+                "full_weeks": 8,
+                "last_week_dates": ["2025-04-28", "2025-04-29", "2025-04-30"],
+                "snapshot": datetime(2025, 5, 2, 23, 59, 59),
+                "last_trading_day_mock": pd.Timestamp("2025-04-30"),
+                "snapshot_week_last_trading_day": pd.Timestamp("2025-04-30"),
+            },
+            {
+                "label": "partial data Mon-Wed",
+                "start": "2025-01-06",
+                "full_weeks": 9,
+                "last_week_dates": ["2025-03-10", "2025-03-11", "2025-03-12"],
+                "snapshot": datetime(2025, 3, 14, 23, 59, 59),
+                "last_trading_day_mock": pd.Timestamp("2025-03-14"),
+                "snapshot_week_last_trading_day": pd.Timestamp("2025-03-14"),
+            },
+        ]
+
+        for sc in scenarios:
+            daily = self._daily_with_last_week_partial(
+                start=sc["start"],
+                full_weeks=sc["full_weeks"],
+                last_week_dates=sc["last_week_dates"],
+            )
+
+            weekly_full = precompute_weekly_bars_for_replay(daily)
+            sliced = slice_weekly_bars_for_snapshot(
+                weekly_full, sc["snapshot"],
+                snapshot_week_last_trading_day=sc["snapshot_week_last_trading_day"],
+            )
+
+            daily_slice = daily[
+                pd.to_datetime(daily["date"]) <= pd.Timestamp(sc["snapshot"].date())
+            ].copy()
+            with patch("data_utils.get_last_trading_day_of_week",
+                       return_value=sc["last_trading_day_mock"]):
+                standard = get_completed_weekly_bars(daily_slice, now=sc["snapshot"])
+
+            self._assert_identical(sliced, standard)
 

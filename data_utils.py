@@ -223,26 +223,45 @@ def get_last_completed_week_end(now: datetime | None = None, daily_latest_date: 
 
 
 def convert_daily_to_weekly(df: pd.DataFrame, cutoff_date: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Aggregate daily bars into completed Friday-anchored weekly bars."""
+    """Aggregate daily bars into completed Friday-anchored weekly bars.
+
+    Each output row includes:
+      - trading_days_count: number of daily bars in that week
+      - last_daily_date:     latest daily date that contributed to the bar
+    """
     daily = ensure_daily_frame(df)
     if cutoff_date is not None:
         daily = daily[daily["date"] <= cutoff_date]
 
     if daily.empty:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(
+            columns=[
+                "date", "open", "high", "low", "close", "volume",
+                "trading_days_count", "last_daily_date",
+            ]
+        )
+
+    daily_indexed = daily.set_index("date")
+    resampler = daily_indexed.resample("W-FRI")
+
+    ohlcv_agg = resampler.agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        trading_days_count=("open", "count"),
+    )
+
+    last_daily = (
+        daily_indexed.index.to_series()
+        .resample("W-FRI")
+        .max()
+        .rename("last_daily_date")
+    )
 
     weekly = (
-        daily.set_index("date")
-        .resample("W-FRI")
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
+        pd.concat([ohlcv_agg, last_daily], axis=1)
         .dropna()
         .reset_index()
     )
@@ -258,7 +277,12 @@ def get_completed_weekly_bars(df: pd.DataFrame, now: datetime | None = None) -> 
     # Get the latest date from the daily data
     daily = ensure_daily_frame(df)
     if daily.empty:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(
+            columns=[
+                "date", "open", "high", "low", "close", "volume",
+                "trading_days_count", "last_daily_date",
+            ]
+        )
 
     daily_latest_date = pd.to_datetime(daily["date"]).max()
 

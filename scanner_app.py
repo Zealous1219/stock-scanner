@@ -1008,6 +1008,12 @@ def save_replay_checkpoint(
 #   get_completed_weekly_bars does: it truncates at the last completed
 #   Friday anchor for the given snapshot_date.  The strategy therefore
 #   sees the same weekly bars it would have seen without the cache.
+#
+#   With the symbol-level completeness guard (trading_days_count ≥ 3,
+#   last_daily_date ≥ last_trading_day), this path is now slightly
+#   stricter than get_completed_weekly_bars for extreme short weeks
+#   (≤2 trading days).  Only the last bar is validated; earlier
+#   historical bars are trusted as-is.
 # ---------------------------------------------------------------------------
 
 # Strategies that consume completed weekly bars and can benefit from the
@@ -1033,6 +1039,7 @@ def precompute_weekly_bars_for_replay(full_df: pd.DataFrame) -> pd.DataFrame:
 def slice_weekly_bars_for_snapshot(
     weekly_full: pd.DataFrame,
     snapshot_date: datetime,
+    snapshot_week_last_trading_day: object = None,
 ) -> pd.DataFrame:
     """Return completed weekly bars visible at snapshot_date.
 
@@ -1042,15 +1049,64 @@ def slice_weekly_bars_for_snapshot(
       anchor is this Friday itself (not the previous one).
     - We keep all weekly bars whose date <= snapshot_date's Friday anchor.
 
+    Completeness guard (symbol-level):
+    The last bar in the sliced result is only kept when it represents a truly
+    *completed* trading week.  A bar anchored at the snapshot Friday that was
+    built from only Mon-Wed daily data (because the symbol's full_df stopped
+    early) is a "half-week" phantom and must be dropped.
+
+    ``snapshot_week_last_trading_day`` is pre-queried once per snapshot week
+    (NOT per symbol) and passed in.  When it is None the guard is
+    conservative and drops the last bar.
+
     This is semantically equivalent to calling get_completed_weekly_bars
     on the daily slice, but avoids the resample on every snapshot.
+
+    Equivalence note:
+    - This guard is slightly stricter than get_completed_weekly_bars for
+      holiday-shortened weeks with 1-2 trading days (threshold = 3).
+    - Only the last bar is validated; earlier historical bars are trusted
+      as-is from full_df.
     """
     if weekly_full.empty:
         return weekly_full
 
     # snapshot_date is a Friday at 23:59:59 — the Friday anchor IS snapshot_date.date()
     friday_anchor = pd.Timestamp(snapshot_date.date())
-    return weekly_full[weekly_full["date"] <= friday_anchor].copy()
+    sliced = weekly_full[weekly_full["date"] <= friday_anchor].copy()
+
+    if sliced.empty:
+        return sliced
+
+    has_guard_fields = (
+        "trading_days_count" in sliced.columns
+        and "last_daily_date" in sliced.columns
+    )
+    if not has_guard_fields:
+        return sliced
+
+    last_bar = sliced.iloc[-1]
+    last_bar_date = pd.Timestamp(last_bar["date"])
+    if last_bar_date != friday_anchor:
+        return sliced
+
+    last_trading_day = snapshot_week_last_trading_day
+
+    if last_trading_day is None:
+        sliced = sliced.iloc[:-1]
+        return sliced
+
+    last_daily_date = pd.Timestamp(last_bar["last_daily_date"])
+    if last_daily_date < pd.Timestamp(last_trading_day):
+        sliced = sliced.iloc[:-1]
+        return sliced
+
+    trading_days_count = int(last_bar["trading_days_count"])
+    if trading_days_count < 3:
+        sliced = sliced.iloc[:-1]
+        return sliced
+
+    return sliced
 
 
 def run_weekly_replay_validation(resume: bool = True) -> None:
@@ -1241,6 +1297,18 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             failed_count = 0
             snapshot_errors = []
 
+            snapshot_week_last_trading_day = None
+            if use_weekly_cache:
+                snapshot_week_last_trading_day = get_last_trading_day_of_week(
+                    pd.Timestamp(snapshot_date.date())
+                )
+                if snapshot_week_last_trading_day is None:
+                    logger.warning(
+                        "[Replay] Snapshot %d/%d date=%s: trading calendar query failed, "
+                        "snapshot-week last bar will be dropped conservatively",
+                        snapshot_idx, len(weekly_dates), snapshot_date_str,
+                    )
+
             for symbol_idx, symbol in enumerate(stocks, 1):
                 symbol_start = time.time()
                 stage_times: Dict[str, float] = {}
@@ -1299,7 +1367,8 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         current_stage = "scan"
                         if use_weekly_cache and symbol in weekly_full_cache and weekly_full_cache[symbol] is not None:
                             precomputed_weekly = slice_weekly_bars_for_snapshot(
-                                weekly_full_cache[symbol], snapshot_date
+                                weekly_full_cache[symbol], snapshot_date,
+                                snapshot_week_last_trading_day,
                             )
                             result = strategy.scan(symbol, df, context, precomputed_weekly=precomputed_weekly)
                         else:
