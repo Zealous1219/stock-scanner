@@ -9,6 +9,7 @@ Covers:
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 import pandas as pd
@@ -793,8 +794,13 @@ class TestFaultTolerance:
         # Only sh.000003 should be processed
         assert "processed=1" in done_logs[0].message
 
-        # Verify no error CSV was written
-        mock_write_errors.assert_not_called()
+        # Verify error handler was called (to handle stale file cleanup)
+        mock_write_errors.assert_called_once()
+        # Verify it was called with empty errors list
+        call_args = mock_write_errors.call_args
+        assert call_args is not None, "write_replay_errors should have been called"
+        errors_arg = call_args[0][0]  # First positional arg is errors list
+        assert errors_arg == [], f"Expected empty errors list, got: {errors_arg}"
         # Verify replay results were written for the valid symbol
         mock_write_results.assert_called_once()
 
@@ -987,6 +993,7 @@ class TestReplayCheckpointResume:
     @patch("scanner_app.os.path.getsize", return_value=10)
     @patch("scanner_app.os.path.exists")
     @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_errors")
     @patch("scanner_app.write_replay_results")
     @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.05, "return_8w": 0.1, "return_12w": 0.15})
     @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
@@ -996,10 +1003,10 @@ class TestReplayCheckpointResume:
     @patch("scanner_app.get_stock_list")
     @patch("scanner_app.load_config")
     @patch("scanner_app.bs")
-    def test_resume_skips_completed_snapshots_and_only_processes_pending(
+    def test_resume_skips_completed_snapshots_and_only_process_pending(
         self, mock_bs, mock_config, mock_stocks, mock_dates,
         mock_create, mock_load_full, mock_load_hist,
-        mock_calc_returns, mock_write_results, mock_ensure,
+        mock_calc_returns, mock_write_results, mock_write_errors, mock_ensure,
         mock_exists, mock_getsize, mock_save_checkpoint, mock_load_checkpoint,
     ):
         mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
@@ -1245,10 +1252,10 @@ class TestReplayCheckpointResume:
 
     @patch("scanner_app.save_replay_checkpoint")
     @patch("scanner_app.load_replay_checkpoint")
-    @patch("scanner_app.os.path.getsize", return_value=0)
-    @patch("scanner_app.os.path.exists")
+    @patch("scanner_app.os.path.getsize", return_value=10)
     @patch("scanner_app.ensure_directories")
     @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.write_replay_errors")
     @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.05, "return_8w": 0.1, "return_12w": 0.15})
     @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
     @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
@@ -1260,11 +1267,11 @@ class TestReplayCheckpointResume:
     def test_no_checkpoint_with_existing_replay_output_raises_error(
         self, mock_bs, mock_config, mock_stocks, mock_dates,
         mock_create, mock_load_full, mock_load_hist,
-        mock_calc_returns, mock_write_results, mock_ensure,
-        mock_exists, mock_getsize, mock_load_checkpoint, mock_save_checkpoint,
+        mock_calc_returns, mock_write_errors, mock_write_results, mock_ensure,
+        mock_getsize, mock_load_checkpoint, mock_save_checkpoint,
     ):
-        """When resume=True and no checkpoint exists but replay CSV already
-        exists, a RuntimeError must be raised and scan must never execute."""
+        """When resume=True and no checkpoint exists but per-snapshot result files
+        already exist, a RuntimeError must be raised and scan must never execute."""
         mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
         mock_bs.logout.return_value = MagicMock()
         mock_config.return_value = self._base_config()
@@ -1277,24 +1284,40 @@ class TestReplayCheckpointResume:
         strategy.scan.return_value = _make_matched_result()
         mock_create.return_value = strategy
 
-        # checkpoint does NOT exist, but replay CSV DOES exist
-        def exists_side_effect(path):
-            return path.endswith(".csv") and not path.endswith("_errors.csv")
+        # Create a temporary directory with existing per-snapshot files
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            replay_dir = os.path.join(tmpdir, "replay")
+            os.makedirs(replay_dir, exist_ok=True)
 
-        mock_exists.side_effect = exists_side_effect
+            # Create an existing per-snapshot result file
+            existing_file = os.path.join(
+                replay_dir, "replay_all_52w_v1_2025-05-02.csv"
+            )
+            pd.DataFrame({"test": [1]}).to_csv(existing_file, index=False)
 
-        try:
-            run_weekly_replay_validation()
-        except RuntimeError as exc:
-            message = str(exc)
-        else:
-            raise AssertionError("Expected RuntimeError when replay CSV exists but no checkpoint")
+            # Patch VALIDATION_DIR to use temp directory
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                # Use real os.path.exists - no mock needed
+                # The temporary directory and files are real, so os.path.exists
+                # will correctly detect them.
 
-        assert "checkpoint" in message.lower(), f"Error message must mention checkpoint: {message}"
-        assert "existing" in message.lower(), f"Error message must mention existing output: {message}"
-        assert "refusing" in message.lower(), f"Error message must mention refusing: {message}"
-        assert "manually" in message.lower(), f"Error message must mention manual action: {message}"
-        strategy.scan.assert_not_called()
+                try:
+                    run_weekly_replay_validation()
+                except RuntimeError as exc:
+                    message = str(exc)
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                else:
+                    raise AssertionError("Expected RuntimeError when per-snapshot result file exists but no checkpoint")
+
+                assert "checkpoint" in message.lower(), f"Error message must mention checkpoint: {message}"
+                assert "existing" in message.lower(), f"Error message must mention existing output: {message}"
+                assert "refusing" in message.lower(), f"Error message must mention refusing: {message}"
+                assert "manually" in message.lower(), f"Error message must mention manual action: {message}"
+                strategy.scan.assert_not_called()
 
     @patch("scanner_app.save_replay_checkpoint")
     @patch("scanner_app.load_replay_checkpoint")
@@ -1389,6 +1412,116 @@ class TestReplayCheckpointResume:
         # On resume, scan must not be called (all snapshots already completed)
         strategy.scan.assert_not_called()
         mock_save_checkpoint.assert_not_called()
+
+    @patch("scanner_app.save_replay_checkpoint")
+    @patch("scanner_app.load_replay_checkpoint")
+    @patch("scanner_app.os.path.getsize", return_value=10)
+    @patch("scanner_app.os.path.exists")
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_errors")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.05, "return_8w": 0.1, "return_12w": 0.15})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_can_run_false_cleans_up_stale_error_file(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_load_full, mock_load_hist,
+        mock_calc_returns, mock_write_results, mock_write_errors, mock_ensure,
+        mock_exists, mock_getsize, mock_load_checkpoint, mock_save_checkpoint,
+    ):
+        """When a snapshot that previously produced errors is re-run with
+        can_run=False, the stale error file is cleaned up, the empty result
+        carrier file is preserved, and the checkpoint is updated."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = self._base_config()
+        mock_stocks.return_value = ["sh.600000"]
+        mock_dates.return_value = [datetime(2025, 5, 2), datetime(2025, 5, 9)]
+
+        strategy = MagicMock()
+        strategy.name = "momentum_reversal_13"
+        # First run: both snapshots can_run=True, S2 scan produces error
+        strategy.can_run.side_effect = [
+            StrategyDecision(should_run=True, reason_code="ok", reason_text="ok"),
+            StrategyDecision(should_run=True, reason_code="ok", reason_text="ok"),
+        ]
+        strategy.scan.side_effect = [
+            _make_matched_result(),
+            RuntimeError("simulated scan failure for S2"),
+        ]
+        mock_create.return_value = strategy
+
+        mock_exists.side_effect = lambda path: False
+
+        run_weekly_replay_validation()
+
+        # S1: no errors → write_replay_errors([], ...)
+        # S2: scan fails → write_replay_errors([{...}], ...)
+        assert mock_write_errors.call_count == 2
+        s1_errors = mock_write_errors.call_args_list[0][0][0]
+        assert len(s1_errors) == 0
+        s2_errors = mock_write_errors.call_args_list[1][0][0]
+        assert len(s2_errors) == 1
+        assert s2_errors[0]["code"] == "sh.600000"
+        assert "simulated scan failure" in s2_errors[0]["error_message"]
+        assert mock_write_errors.call_args_list[1][0][4] == "2025-05-09"
+
+        # Both snapshots saved to checkpoint
+        assert mock_save_checkpoint.call_count == 2
+
+        # ----- Second run: S2 is pending, can_run=False -----
+        strategy.scan.reset_mock()
+        strategy.can_run.reset_mock()
+        mock_write_results.reset_mock()
+        mock_write_errors.reset_mock()
+        mock_save_checkpoint.reset_mock()
+
+        strategy.can_run.side_effect = lambda ctx: StrategyDecision(
+            should_run=ctx.now.strftime("%Y-%m-%d") != "2025-05-09",
+            reason_code="incomplete_week" if ctx.now.strftime("%Y-%m-%d") == "2025-05-09" else "ok",
+            reason_text="skipped" if ctx.now.strftime("%Y-%m-%d") == "2025-05-09" else "ok",
+        )
+
+        mock_load_checkpoint.return_value = {
+            "experiment_tag": "mr13_all_52w_v1",
+            "universe": "all",
+            "lookback_weeks": 52,
+            "version": "v1",
+            "snapshot_dates": ["2025-05-02", "2025-05-09"],
+            "completed_snapshots": ["2025-05-02"],
+            "replay_data_end_date": "2025-10-03",
+        }
+
+        mock_exists.side_effect = lambda path: (
+            path.endswith(".checkpoint.json") or path.endswith(".csv")
+        )
+
+        run_weekly_replay_validation()
+
+        # S2 (can_run=False) calls write_replay_errors([], ...)
+        # to clean up the stale error file from the first run
+        mock_write_errors.assert_called_once()
+        noop_errors = mock_write_errors.call_args[0][0]
+        assert noop_errors == [], "No-op snapshot must call write_replay_errors([])"
+        assert mock_write_errors.call_args[0][4] == "2025-05-09"
+
+        # Empty result carrier file is also written
+        mock_write_results.assert_called_once()
+        noop_results = mock_write_results.call_args[0][0]
+        assert noop_results == [], "No-op snapshot must call write_replay_results([])"
+        assert mock_write_results.call_args[0][4] == "2025-05-09"
+
+        # scan is NOT called (can_run=False)
+        strategy.scan.assert_not_called()
+
+        # Checkpoint updated to include S2
+        mock_save_checkpoint.assert_called_once()
+        assert mock_save_checkpoint.call_args.args[5] == ["2025-05-02", "2025-05-09"]
 
 
 # ---------------------------------------------------------------------------

@@ -351,6 +351,23 @@ class TestBlackHorse:
         assert not result.matched
         assert result.reason_code == "weekly_volume_not_expanding"
 
+    def test_matched_result_includes_signal_date(self) -> None:
+        """Matched result details contain signal_date equal to week_3_end (third bar's end)."""
+        closes = [50.0] * 9 + [52.0, 55.0, 60.0]
+        volumes = [100_000] * 9 + [100_000, 120_000, 150_000]
+        weekly = _make_weekly(closes, volumes)
+        _set_bar(weekly, 9,  open=51.0, close=52.0)
+        _set_bar(weekly, 10, open=52.0, close=55.0)
+        _set_bar(weekly, 11, open=55.0, close=60.0)
+        result = _run_bh_scan(weekly)
+
+        assert result.matched
+        d = result.details
+        assert "signal_date" in d
+        expected = pd.Timestamp(weekly.at[11, "date"]).strftime("%Y-%m-%d")
+        assert d["signal_date"] == expected
+        assert d["signal_date"] == d["week_3_end"]
+
     def test_insufficient_weekly_bars(self) -> None:
         """Fewer than min_weekly_bars → reason_code 'insufficient_weekly_bars'."""
         weekly = _make_weekly([50.0] * 8)  # only 8 weeks (min = 12)

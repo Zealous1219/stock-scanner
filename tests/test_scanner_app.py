@@ -509,6 +509,36 @@ class TestCalculateForwardReturns:
         assert pd.isna(returns["return_20w"])
         assert mock_logger.warning.call_count == 5
 
+    def test_black_horse_result_with_signal_date_produces_non_nan_returns(self):
+        """BlackHorse result details containing signal_date → forward returns are not all NaN."""
+        signal_date = "2024-03-22"
+        details = {
+            "signal_type": "black_horse_ready",
+            "signal_date": signal_date,
+            "latest_week_end": signal_date,
+            "week_3_end": signal_date,
+        }
+        result = StrategyResult(
+            matched=True,
+            reason_code="matched",
+            reason_text="matched",
+            details=details,
+        )
+        df = self._make_df([
+            ("2024-03-22", 100.0),
+            ("2024-04-19", 110.0),
+            ("2024-05-17", 120.0),
+            ("2024-06-14", 130.0),
+        ])
+        returns = calculate_forward_returns("sh.600000", result, full_df=df)
+
+        assert returns["return_4w"] == pytest.approx(0.10)
+        assert returns["return_8w"] == pytest.approx(0.20)
+        assert returns["return_12w"] == pytest.approx(0.30)
+        assert not pd.isna(returns["return_4w"])
+        assert not pd.isna(returns["return_8w"])
+        assert not pd.isna(returns["return_12w"])
+
     def test_empty_dataframe_keeps_nan(self):
         empty_df = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 

@@ -814,27 +814,60 @@ def build_replay_record(
     return record
 
 
-def write_replay_results(results: List[Dict[str, Any]], universe: str, lookback_weeks: int, version: str, write_header: bool = True) -> str:
-    """Write replay validation results to CSV.
+# Replay result CSV columns (must match build_replay_record output)
+_REPLAY_RESULT_COLUMNS = [
+    "experiment_tag",
+    "universe",
+    "lookback_weeks",
+    "code",
+    "strategy",
+    "snapshot_date",
+    "signal_date",
+    "reason_code",
+    "signal_type",
+    "downtrend_weeks",
+    "big1_date",
+    "small1_date",
+    "small2_date",
+    "small3_date",
+    "pivot_bar_date",
+    "forward_4w_return",
+    "forward_8w_return",
+    "forward_12w_return",
+    "forward_16w_return",
+    "forward_20w_return",
+]
+
+
+def write_replay_results(
+    results: List[Dict[str, Any]],
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+    snapshot_date: str,
+) -> str:
+    """Write replay validation results to a per-snapshot CSV file.
+
+    Each snapshot gets its own result file. Re-running the same snapshot
+    overwrites the file instead of appending, preventing duplicate rows.
+    Even empty results will produce a CSV with headers for schema stability.
 
     Args:
         results: List of replay records to write
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
-        write_header: Whether to write CSV header (True for new file, False for append)
+        snapshot_date: Snapshot date in YYYY-MM-DD format
     """
-    replay_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}.csv")
+    replay_file = get_replay_snapshot_result_path(universe, lookback_weeks, version, snapshot_date)
 
-    df = pd.DataFrame(results)
-
-    if write_header:
-        df.to_csv(replay_file, index=False, encoding="utf-8-sig")
-        logger.info("Replay results written to %s (with header)", replay_file)
+    if results:
+        df = pd.DataFrame(results)
     else:
-        df.to_csv(replay_file, mode="a", header=False, index=False, encoding="utf-8-sig")
-        logger.info("Replay results appended to %s (no header)", replay_file)
-
+        # Write empty CSV with headers for schema stability
+        df = pd.DataFrame(columns=_REPLAY_RESULT_COLUMNS)
+    df.to_csv(replay_file, index=False, encoding="utf-8-sig")
+    logger.info("Replay results written to %s (%d rows)", replay_file, len(df))
     return replay_file
 
 
@@ -843,32 +876,71 @@ def write_replay_errors(
     universe: str,
     lookback_weeks: int,
     version: str,
-    write_header: bool = True
+    snapshot_date: str,
 ) -> str:
-    """Write replay error records to CSV.
+    """Write replay error records to a per-snapshot CSV file.
+
+    Each snapshot gets its own error file. Re-running the same snapshot
+    overwrites the file instead of appending, preventing duplicate rows.
+    If errors is empty, the old error file (if any) is removed to prevent
+    stale error records from persisting.
 
     Args:
         errors: List of error records to write
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
-        write_header: Whether to write CSV header (True for new file, False for append)
+        snapshot_date: Snapshot date in YYYY-MM-DD format
     """
-    error_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}_errors.csv")
+    error_file = get_replay_snapshot_error_path(universe, lookback_weeks, version, snapshot_date)
 
     if not errors:
+        # No errors this run — remove stale error file if it exists
+        try:
+            if os.path.exists(error_file):
+                os.remove(error_file)
+                logger.info("Stale error file removed: %s", error_file)
+        except OSError as exc:
+            logger.warning("Failed to remove stale error file %s: %s", error_file, exc)
         return error_file
 
     df = pd.DataFrame(errors)
-
-    if write_header:
-        df.to_csv(error_file, index=False, encoding="utf-8-sig")
-        logger.info("Replay errors written to %s (with header)", error_file)
-    else:
-        df.to_csv(error_file, mode="a", header=False, index=False, encoding="utf-8-sig")
-        logger.info("Replay errors appended to %s (no header)", error_file)
+    df.to_csv(error_file, index=False, encoding="utf-8-sig")
+    logger.info("Replay errors written to %s (%d records)", error_file, len(df))
 
     return error_file
+
+
+def get_replay_snapshot_result_path(universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
+    """Return the per-snapshot result file path for a replay experiment.
+
+    Args:
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+        snapshot_date: Snapshot date in YYYY-MM-DD format
+    """
+    return os.path.join(
+        VALIDATION_DIR,
+        "replay",
+        f"replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv",
+    )
+
+
+def get_replay_snapshot_error_path(universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
+    """Return the per-snapshot error file path for a replay experiment.
+
+    Args:
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+        snapshot_date: Snapshot date in YYYY-MM-DD format
+    """
+    return os.path.join(
+        VALIDATION_DIR,
+        "replay",
+        f"replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv",
+    )
 
 
 def get_replay_checkpoint_path(universe: str, lookback_weeks: int, version: str) -> str:
@@ -878,6 +950,49 @@ def get_replay_checkpoint_path(universe: str, lookback_weeks: int, version: str)
         "replay",
         f"replay_{universe}_{lookback_weeks}w_{version}.checkpoint.json",
     )
+
+
+def _verify_completed_snapshot_files(
+    completed_snapshots: List[str],
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+) -> None:
+    """Verify that all completed snapshots have their result files.
+
+    This is a conservative check: if the checkpoint claims a snapshot is
+    completed but the corresponding result file is missing, we refuse to
+    resume to avoid inconsistent state.
+
+    Args:
+        completed_snapshots: List of completed snapshot dates (YYYY-MM-DD)
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+
+    Raises:
+        RuntimeError: If any completed snapshot is missing its result file.
+    """
+    missing_files = []
+
+    for snapshot_date in completed_snapshots:
+        result_path = get_replay_snapshot_result_path(
+            universe, lookback_weeks, version, snapshot_date
+        )
+        if not os.path.exists(result_path):
+            missing_files.append((snapshot_date, result_path))
+
+    if missing_files:
+        missing_str = ", ".join(
+            f"{date} ({path})" for date, path in missing_files
+        )
+        raise RuntimeError(
+            "Checkpoint marks the following snapshots as completed, "
+            "but their result files are missing. "
+            "Refusing to resume due to inconsistent state. "
+            f"Missing files: {missing_str}. "
+            "Please delete the checkpoint and run a fresh replay."
+        )
 
 
 def load_replay_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
@@ -1172,7 +1287,10 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
     - Replay frequency: one run per completed weekly bar
     - Strategy: momentum_reversal_13 only
 
-    Output: validation/replay/replay_{universe}_{lookback_weeks}w_{version}.csv
+    Output: validation/replay/replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv
+            (per-snapshot result files, overwritten on re-run)
+            validation/replay/replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv
+            (per-snapshot error files, overwritten on re-run)
     """
     logger.info("=" * 60)
     logger.info("Starting weekly historical replay validation")
@@ -1232,8 +1350,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         replay_data_end_date = (last_snapshot_date + timedelta(weeks=21)).strftime("%Y-%m-%d")
         logger.info("Replay data end date (fixed): %s", replay_data_end_date)
 
-        replay_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}.csv")
-        error_file = os.path.join(VALIDATION_DIR, "replay", f"replay_{universe}_{lookback_weeks}w_{version}_errors.csv")
         checkpoint_path = get_replay_checkpoint_path(universe, lookback_weeks, version)
 
         completed_snapshots: List[str] = []
@@ -1269,15 +1385,40 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             replay_data_end_date = resume_replay_data_end_date
             logger.info("[Replay] Resume with replay_data_end_date: %s", replay_data_end_date)
 
-            if not os.path.exists(replay_file):
-                raise RuntimeError(
-                    "Replay checkpoint exists but replay result CSV is missing; "
-                    "refusing to resume because checkpoint is the only progress truth and result carrier is missing"
-                )
+            # Verify checkpoint consistency: all completed snapshots must have their result files
+            _verify_completed_snapshot_files(
+                completed_snapshots, universe, lookback_weeks, version
+            )
 
             run_mode = "resume"
         elif resume:
             logger.info("[Replay] No checkpoint detected; starting fresh replay run")
+
+        if run_mode == "fresh":
+            # Conservative: refuse to silently destroy existing per-snapshot output files
+            # when there is no checkpoint. The checkpoint is the sole source of truth;
+            # per-snapshot CSV files are just result carriers and must not be
+            # used to infer completion status or overwrite intent.
+            replay_dir = os.path.join(VALIDATION_DIR, "replay")
+            if os.path.exists(replay_dir):
+                import glob
+                pattern = os.path.join(
+                    replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_????-??-??*.csv"
+                )
+                existing_files = glob.glob(pattern)
+                if existing_files:
+                    raise RuntimeError(
+                        "No replay checkpoint found, but existing per-snapshot replay files "
+                        "are already present.  The checkpoint is the sole source of truth "
+                        "for completed snapshots; per-snapshot CSV files are result carriers only "
+                        "and cannot be used to infer progress or overwrite intent.  "
+                        "Refusing to proceed to avoid inconsistent state.  "
+                        "Please manually remove or relocate the existing output file(s) "
+                        "before running the replay again."
+                    )
+            # Remove any stale checkpoint to start clean
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
 
         completed_snapshot_set = set(completed_snapshots)
         snapshots_to_process = [
@@ -1294,20 +1435,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         )
 
         if run_mode == "fresh":
-            # Conservative: refuse to silently destroy existing output files
-            # when there is no checkpoint.  The checkpoint is the sole source
-            # of truth; CSV files are just result carriers and must not be
-            # used to infer completion status or overwrite intent.
-            if os.path.exists(replay_file) or os.path.exists(error_file):
-                raise RuntimeError(
-                    "No replay checkpoint found, but existing replay output file(s) "
-                    "are already present.  The checkpoint is the sole source of truth "
-                    "for completed snapshots; replay CSV files are result carriers only "
-                    "and cannot be used to infer progress or overwrite intent.  "
-                    "Refusing to proceed to avoid inconsistent state.  "
-                    "Please manually remove or relocate the existing output file(s) "
-                    "before running the replay again."
-                )
+            # For fresh run, remove any existing checkpoint to start clean
             if os.path.exists(checkpoint_path):
                 os.remove(checkpoint_path)
 
@@ -1358,6 +1486,17 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     snapshot_idx, len(weekly_dates), snapshot_date_str, snapshot_elapsed,
                 )
 
+                # Write result carrier file first (even if empty) before checkpoint
+                write_replay_results(
+                    [], universe, lookback_weeks, version, snapshot_date_str
+                )
+
+                # Clean up any stale error file for this no-op snapshot
+                write_replay_errors(
+                    [], universe, lookback_weeks, version, snapshot_date_str
+                )
+
+                # Now mark as completed and save checkpoint
                 completed_snapshot_set.add(snapshot_date_str)
                 completed_snapshots.append(snapshot_date_str)
                 completed_snapshots.sort()
@@ -1523,15 +1662,20 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
             snapshot_elapsed = time.time() - snapshot_start
 
-            # Write replay results if any
-            if snapshot_results:
-                write_header = (not os.path.exists(replay_file)) or os.path.getsize(replay_file) == 0
-                write_replay_results(snapshot_results, universe, lookback_weeks, version, write_header=write_header)
+            # Write per-snapshot result file (even if empty — ensures carrier file exists)
+            write_replay_results(
+                snapshot_results, universe, lookback_weeks, version, snapshot_date_str
+            )
 
-            # Write error records if any
-            if snapshot_errors:
-                error_write_header = (not os.path.exists(error_file)) or os.path.getsize(error_file) == 0
-                write_replay_errors(snapshot_errors, universe, lookback_weeks, version, write_header=error_write_header)
+            # Write per-snapshot error file (overwrite mode; removes stale file if no errors)
+            write_replay_errors(
+                snapshot_errors, universe, lookback_weeks, version, snapshot_date_str
+            )
+
+            # Only after files are written successfully, mark snapshot as completed
+            completed_snapshot_set.add(snapshot_date_str)
+            completed_snapshots.append(snapshot_date_str)
+            completed_snapshots.sort()
 
             logger.info(
                 "[Replay] Snapshot %d/%d done: date=%s elapsed=%.1fs "
@@ -1540,9 +1684,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 snapshot_elapsed, processed_count, len(snapshot_results), failed_count,
             )
 
-            completed_snapshot_set.add(snapshot_date_str)
-            completed_snapshots.append(snapshot_date_str)
-            completed_snapshots.sort()
+            # Save checkpoint after successful file write
             save_replay_checkpoint(
                 checkpoint_path,
                 experiment_tag,
@@ -1559,6 +1701,115 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
     finally:
         bs.logout()
         logger.info("Weekly replay validation finished")
+
+
+def merge_replay_snapshot_files(
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+    output_path: str | None = None,
+) -> str:
+    """Merge per-snapshot result files into a single CSV.
+
+    This is a helper function for downstream analysis. It reads all
+    per-snapshot result files matching the pattern and merges them
+    into a single CSV file.
+
+    Args:
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+        output_path: Output file path. If None, defaults to the old aggregate name.
+
+    Returns:
+        Path to the merged CSV file.
+    """
+    import glob
+
+    replay_dir = os.path.join(VALIDATION_DIR, "replay")
+    pattern = os.path.join(
+        replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_????-??-??.csv"
+    )
+
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No per-snapshot result files found matching: {pattern}")
+
+    logger.info("Merging %d per-snapshot result files...", len(files))
+
+    dfs = []
+    for f in files:
+        df = pd.read_csv(f, encoding="utf-8-sig")
+        dfs.append(df)
+
+    merged = pd.concat(dfs, ignore_index=True)
+
+    if output_path is None:
+        output_path = os.path.join(
+            replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_merged.csv"
+        )
+
+    merged.to_csv(output_path, index=False, encoding="utf-8-sig")
+    logger.info("Merged result written to %s (%d rows)", output_path, len(merged))
+
+    return output_path
+
+
+def merge_replay_error_snapshot_files(
+    universe: str,
+    lookback_weeks: int,
+    version: str,
+    output_path: str | None = None,
+) -> str:
+    """Merge per-snapshot error files into a single CSV.
+
+    This is a helper function for downstream analysis. It reads all
+    per-snapshot error files matching the pattern and merges them
+    into a single CSV file.
+
+    Args:
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+        output_path: Output file path. If None, defaults to the old aggregate name.
+
+    Returns:
+        Path to the merged CSV file.
+    """
+    import glob
+
+    replay_dir = os.path.join(VALIDATION_DIR, "replay")
+    pattern = os.path.join(
+        replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_????-??-??_errors.csv"
+    )
+
+    files = sorted(glob.glob(pattern))
+    if not files:
+        logger.info("No per-snapshot error files found matching: %s", pattern)
+        output_path = output_path or os.path.join(
+            replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_errors_merged.csv"
+        )
+        pd.DataFrame().to_csv(output_path, index=False, encoding="utf-8-sig")
+        return output_path
+
+    logger.info("Merging %d per-snapshot error files...", len(files))
+
+    dfs = []
+    for f in files:
+        df = pd.read_csv(f, encoding="utf-8-sig")
+        dfs.append(df)
+
+    merged = pd.concat(dfs, ignore_index=True)
+
+    if output_path is None:
+        output_path = os.path.join(
+            replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_errors_merged.csv"
+        )
+
+    merged.to_csv(output_path, index=False, encoding="utf-8-sig")
+    logger.info("Merged errors written to %s (%d rows)", output_path, len(merged))
+
+    return output_path
 
 
 if __name__ == "__main__":

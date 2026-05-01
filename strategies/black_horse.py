@@ -54,6 +54,7 @@ class BlackHorseStrategy(BaseStrategy):
 
         return {
             "signal_type": "black_horse_ready",
+            "signal_date": enriched.iloc[-1]["week_end"],
             "latest_week_end": enriched.iloc[-1]["week_end"],
             "week_1_end": enriched.iloc[0]["week_end"],
             "week_2_end": enriched.iloc[1]["week_end"],
