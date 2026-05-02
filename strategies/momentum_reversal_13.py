@@ -160,13 +160,15 @@ class MomentumReversal13Strategy(BaseStrategy):
 
         使用 big1 之前 20 周的成交量计算均值，不包含 big1 自身的成交量。
         如果 big1 位置之前的数据不足20周，返回 None 表示无法判断。
+        如果 20 周窗口在日历上不连续（存在明显 gap），也返回 None，
+        避免将过于久远的数据混入均值计算。
 
         参数:
             weekly: 周线数据
             idx: big1 的位置索引
 
         返回值:
-            float | None: MA20(volume) 值，数据不足时返回 None
+            float | None: MA20(volume) 值，数据不足或不连续时返回 None
         """
         if idx < 20:  # big1 之前需要至少 20 周数据
             return None
@@ -174,9 +176,42 @@ class MomentumReversal13Strategy(BaseStrategy):
         # 计算 big1 之前 20 周的成交量均值（不含 big1 自身）
         # 使用 idx-20 到 idx-1 这 20 周的数据
         window = weekly.iloc[idx - 20 : idx]
+
+        # 周连续性校验：20 行窗口的日历跨度不应超过 140 天
+        # （理论跨度 133 天 = 19 周间隔，额外容忍约 1 周）
+        if not self._is_weekly_window_contiguous(window):
+            return None
+
         ma20 = window["volume"].mean()
 
         return float(ma20)
+
+    @staticmethod
+    def _is_weekly_window_contiguous(window: pd.DataFrame) -> bool:
+        """
+        校验一组周线窗口的连续性。
+
+        通过窗口内最早和最晚的周结束日期（date 列）计算日历跨度。
+        对 20 行窗口最大允许 140 天（19*7 + 7 容忍），
+        超过此值说明中间缺了若干自然周，不应视为连续 20 周。
+
+        参数:
+            window: 周线 DataFrame 切片
+
+        返回值:
+            bool: 连续性校验通过返回 True
+        """
+        if len(window) < 2:
+            return True
+
+        first_date = pd.to_datetime(window.iloc[0]["date"])
+        last_date = pd.to_datetime(window.iloc[-1]["date"])
+        calendar_span = (last_date - first_date).days
+
+        # 对 20 行窗口：19 个周间隔 * 7 天 + 7 天容忍 = 140 天
+        max_allowed_span = 19 * 7 + 7  # 140 天
+
+        return calendar_span <= max_allowed_span
 
     def _detect_downtrend(self, weekly: pd.DataFrame, end_idx: int) -> bool:
         """

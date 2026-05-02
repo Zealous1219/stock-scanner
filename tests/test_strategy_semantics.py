@@ -257,6 +257,135 @@ class TestMr13Scan:
 
 
 # ===========================================================================
+# MomentumReversal13 — _calc_weekly_volume_ma20 continuity check
+# ===========================================================================
+
+class TestMr13VolumeMA20:
+    """Direct tests for the weekly volume MA20 + continuity validation.
+
+    The continuity check ensures the 20-row window represents roughly
+    20 consecutive calendar weeks; if the actual date span exceeds 140
+    days (= 19*7 + 7 tolerance) the window is considered gapped and
+    ``None`` is returned.
+    """
+
+    @pytest.fixture
+    def strategy(self) -> MomentumReversal13Strategy:
+        return MomentumReversal13Strategy()
+
+    # ------------------------------------------------------------------
+    # contiguous 20-week window
+    # ------------------------------------------------------------------
+
+    def test_contiguous_window_returns_ma20(
+        self, strategy: MomentumReversal13Strategy
+    ) -> None:
+        """Continuous weekly bars → MA20 is computed normally."""
+        closes = [50.0] * 40
+        volumes = [100_000] * 40
+        weekly = _make_weekly(closes, volumes)
+
+        # idx=25  → window = rows [5:25]  (20 continuous W-FRI rows)
+        ma20 = strategy._calc_weekly_volume_ma20(weekly, 25)
+        expected = weekly.iloc[5:25]["volume"].mean()
+        assert ma20 == pytest.approx(expected)
+
+    def test_contiguous_window_on_boundary_returns_ma20(
+        self, strategy: MomentumReversal13Strategy
+    ) -> None:
+        """big1 at idx=20 → window = rows [0:20] (earliest possible)."""
+        closes = [50.0] * 30
+        volumes = [100_000] * 30
+        weekly = _make_weekly(closes, volumes)
+
+        ma20 = strategy._calc_weekly_volume_ma20(weekly, 20)
+        expected = weekly.iloc[0:20]["volume"].mean()
+        assert ma20 == pytest.approx(expected)
+
+    # ------------------------------------------------------------------
+    # fewer than 20 prior weeks → None
+    # ------------------------------------------------------------------
+
+    def test_fewer_than_20_prior_weeks_returns_none(
+        self, strategy: MomentumReversal13Strategy
+    ) -> None:
+        """idx < 20 → None (existing guard)."""
+        weekly = _make_weekly([50.0] * 25, [100_000] * 25)
+        assert strategy._calc_weekly_volume_ma20(weekly, 19) is None
+        assert strategy._calc_weekly_volume_ma20(weekly, 0) is None
+
+    # ------------------------------------------------------------------
+    # gapped window → None
+    # ------------------------------------------------------------------
+
+    def test_gapped_window_returns_none(
+        self, strategy: MomentumReversal13Strategy
+    ) -> None:
+        """20-row window with a 3-week gap in dates → span > 140d → None.
+
+        Layout (24 rows total):
+          rows  0- 9 : 10 continuous W-FRI (2024-01-05 … 2024-03-08)
+          gap        : 3 weeks missing (2024-03-15 skipped)
+          rows 10-23 : 14 continuous W-FRI (2024-03-29 … 2024-06-28)
+
+        For idx=22 → window = rows [2:22]
+          first = 2024-01-19, last = 2024-06-14  →  span ≈ 147d > 140d
+        """
+        dates = list(pd.date_range("2024-01-05", periods=10, freq="W-FRI"))
+        dates.extend(pd.date_range("2024-03-29", periods=14, freq="W-FRI"))
+
+        n = len(dates)
+        closes = [50.0] * n
+        volumes = [100_000] * n
+        weekly = pd.DataFrame({
+            "date": dates,
+            "open": [round(c * 0.99, 2) for c in closes],
+            "high": [round(c * 1.02, 2) for c in closes],
+            "low": [round(c * 0.98, 2) for c in closes],
+            "close": closes,
+            "volume": volumes,
+        })
+
+        ma20 = strategy._calc_weekly_volume_ma20(weekly, 22)
+        assert ma20 is None
+
+    # ------------------------------------------------------------------
+    # one-week gap still within tolerance → allowed
+    # ------------------------------------------------------------------
+
+    def test_one_week_tolerance_still_allowed(
+        self, strategy: MomentumReversal13Strategy
+    ) -> None:
+        """20-row window spanning exactly 140d → passes continuity check.
+
+        Layout (20 rows):
+          rows  0- 9 : 10 continuous W-FRI (2024-01-05 … 2024-03-08)
+          gap        : 1 week missing (2024-03-15 skipped)
+          rows 10-19 : 10 continuous W-FRI (2024-03-22 … 2024-05-24)
+
+        span = 2024-05-24 − 2024-01-05 = 140d  ≤ 140d → allowed
+        """
+        dates = list(pd.date_range("2024-01-05", periods=10, freq="W-FRI"))
+        dates.extend(pd.date_range("2024-03-22", periods=10, freq="W-FRI"))
+
+        n = len(dates)
+        closes = [50.0] * n
+        volumes = [100_000] * n
+        weekly = pd.DataFrame({
+            "date": dates,
+            "open": [round(c * 0.99, 2) for c in closes],
+            "high": [round(c * 1.02, 2) for c in closes],
+            "low": [round(c * 0.98, 2) for c in closes],
+            "close": closes,
+            "volume": volumes,
+        })
+
+        ma20 = strategy._calc_weekly_volume_ma20(weekly, 20)
+        expected = weekly.iloc[0:20]["volume"].mean()
+        assert ma20 == pytest.approx(expected)
+
+
+# ===========================================================================
 # BlackHorse — full scan tests
 # ===========================================================================
 
