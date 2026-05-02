@@ -1,6 +1,6 @@
 """Tests for scanner_app.py focusing on cache refresh and stock pool fallback logic."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import Mock, patch, MagicMock
 import os
 import pytest
@@ -280,6 +280,184 @@ class TestLoadOrUpdateData:
             assert fetched is True
             # Should return tail of fetched data
             assert len(result_df) == 3
+
+    @patch("scanner_app.os.path.exists")
+    @patch("scanner_app.pd.read_csv")
+    @patch("scanner_app.fetch_historical_data")
+    @patch("scanner_app.ensure_daily_frame")
+    def test_datetime_now_called_once_file_not_exists(
+        self, mock_ensure, mock_fetch, mock_read_csv, mock_exists
+    ):
+        """验证文件不存在路径下 datetime.now() 只被调用一次"""
+        call_counter = {"count": 0}
+        fixed_now = datetime(2026, 4, 22, 14, 30)
+
+        def counting_now():
+            call_counter["count"] += 1
+            return fixed_now
+
+        with patch("scanner_app.datetime") as mock_datetime:
+            mock_datetime.now = counting_now
+            mock_datetime.side_effect = datetime
+            mock_datetime.now = counting_now
+
+            mock_exists.return_value = False
+            mock_fetch.return_value = pd.DataFrame({
+                "date": ["2026-04-20", "2026-04-21", "2026-04-22"],
+                "open": [10.0, 10.1, 10.2],
+                "high": [10.5, 10.6, 10.7],
+                "low": [9.5, 9.6, 9.7],
+                "close": [10.0, 10.1, 10.2],
+                "volume": [1000, 1100, 1200],
+            })
+            mock_ensure.return_value = mock_fetch.return_value.copy()
+
+            load_or_update_data(
+                symbol="sh.000001",
+                lookback_days=3,
+                initial_days=400,
+                request_interval=0,
+            )
+
+            assert call_counter["count"] == 1
+
+    @patch("scanner_app.os.path.exists")
+    @patch("scanner_app.pd.read_csv")
+    @patch("scanner_app.fetch_historical_data")
+    @patch("scanner_app.ensure_daily_frame")
+    @patch("scanner_app.should_force_refresh_on_friday")
+    def test_datetime_now_called_once_cache_hit_path(
+        self, mock_force, mock_ensure, mock_fetch, mock_read_csv, mock_exists
+    ):
+        """验证缓存命中路径下 datetime.now() 只被调用一次"""
+        call_counter = {"count": 0}
+        fixed_now = datetime(2026, 4, 24, 20, 30)  # Friday after 20:00
+
+        def counting_now():
+            call_counter["count"] += 1
+            return fixed_now
+
+        with patch("scanner_app.datetime") as mock_datetime:
+            mock_datetime.now = counting_now
+            mock_datetime.side_effect = datetime
+
+            mock_exists.return_value = True
+            cached_df = pd.DataFrame({
+                "date": [f"2026-03-{i:02d}" for i in range(1, 32)] + [f"2026-04-{i:02d}" for i in range(1, 30)],
+                "open": [10.0 + i * 0.01 for i in range(60)],
+                "high": [10.5 + i * 0.01 for i in range(60)],
+                "low": [9.5 + i * 0.01 for i in range(60)],
+                "close": [10.0 + i * 0.01 for i in range(60)],
+                "volume": [1000 + i * 10 for i in range(60)],
+            })
+            mock_read_csv.return_value = cached_df
+
+            def ensure_side_effect(df):
+                result = df.copy()
+                result["date"] = pd.to_datetime(result["date"])
+                return result
+            mock_ensure.side_effect = ensure_side_effect
+            mock_force.return_value = True
+
+            load_or_update_data(
+                symbol="sh.000001",
+                lookback_days=5,
+                initial_days=400,
+                request_interval=0,
+            )
+
+            assert call_counter["count"] == 1
+
+    @patch("scanner_app.os.path.exists")
+    @patch("scanner_app.pd.read_csv")
+    @patch("scanner_app.fetch_historical_data")
+    @patch("scanner_app.ensure_daily_frame")
+    def test_start_date_and_today_derived_from_same_now(
+        self, mock_ensure, mock_fetch, mock_read_csv, mock_exists
+    ):
+        """验证 start_date 和 end_date 基于同一个 now 推导"""
+        fixed_now = datetime(2026, 4, 22, 14, 30)
+        initial_days = 400
+
+        with patch("scanner_app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+            mock_datetime.side_effect = datetime
+
+            mock_exists.return_value = False
+            mock_fetch.return_value = pd.DataFrame({
+                "date": ["2026-04-22"],
+                "open": [10.0],
+                "high": [10.5],
+                "low": [9.5],
+                "close": [10.0],
+                "volume": [1000],
+            })
+            mock_ensure.return_value = mock_fetch.return_value.copy()
+
+            load_or_update_data(
+                symbol="sh.000001",
+                lookback_days=1,
+                initial_days=initial_days,
+                request_interval=0,
+            )
+
+            call_args = mock_fetch.call_args
+            start_date = call_args[0][1]
+            end_date = call_args[0][2]
+
+            expected_start = (fixed_now - timedelta(days=initial_days)).strftime("%Y-%m-%d")
+            expected_end = fixed_now.strftime("%Y-%m-%d")
+
+            assert start_date == expected_start
+            assert end_date == expected_end
+
+    @patch("scanner_app.os.path.exists")
+    @patch("scanner_app.pd.read_csv")
+    @patch("scanner_app.fetch_historical_data")
+    @patch("scanner_app.ensure_daily_frame")
+    @patch("scanner_app.should_force_refresh_on_friday")
+    def test_friday_refresh_uses_captured_now(
+        self, mock_force, mock_ensure, mock_fetch, mock_read_csv, mock_exists
+    ):
+        """验证 should_force_refresh_on_friday 使用的是入口捕获的 now"""
+        captured_args = []
+        original_force = should_force_refresh_on_friday
+
+        def capturing_force(now):
+            captured_args.append(now)
+            return original_force(now)
+
+        with patch("scanner_app.datetime") as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 4, 24, 20, 30)
+            mock_datetime.side_effect = datetime
+
+            mock_exists.return_value = True
+            cached_df = pd.DataFrame({
+                "date": [f"2026-03-{i:02d}" for i in range(1, 32)] + [f"2026-04-{i:02d}" for i in range(1, 30)],
+                "open": [10.0 + i * 0.01 for i in range(60)],
+                "high": [10.5 + i * 0.01 for i in range(60)],
+                "low": [9.5 + i * 0.01 for i in range(60)],
+                "close": [10.0 + i * 0.01 for i in range(60)],
+                "volume": [1000 + i * 10 for i in range(60)],
+            })
+            mock_read_csv.return_value = cached_df
+
+            def ensure_side_effect(df):
+                result = df.copy()
+                result["date"] = pd.to_datetime(result["date"])
+                return result
+            mock_ensure.side_effect = ensure_side_effect
+            mock_force.side_effect = capturing_force
+
+            load_or_update_data(
+                symbol="sh.000001",
+                lookback_days=5,
+                initial_days=400,
+                request_interval=0,
+            )
+
+            assert len(captured_args) == 1
+            assert captured_args[0] == datetime(2026, 4, 24, 20, 30)
 
 
 class TestGetLatestTradingDay:

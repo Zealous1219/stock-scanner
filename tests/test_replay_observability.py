@@ -1091,7 +1091,7 @@ class TestReplayCheckpointResume:
 
         mock_exists.side_effect = exists_side_effect
 
-        def write_results_side_effect(results, universe, lookback_weeks, version, write_header=True):
+        def write_results_side_effect(results, strategy_slug, universe, lookback_weeks, version, write_header=True):
             snapshot_date = results[0]["snapshot_date"]
             if snapshot_date == "2025-05-09":
                 raise RuntimeError("simulated interruption during snapshot write")
@@ -1123,7 +1123,7 @@ class TestReplayCheckpointResume:
         mock_save_checkpoint.reset_mock()
         mock_load_checkpoint.return_value = checkpoint_payload
 
-        def write_results_resume(results, universe, lookback_weeks, version, write_header=True):
+        def write_results_resume(results, strategy_slug, universe, lookback_weeks, version, write_header=True):
             return "replay.csv"
 
         mock_write_results.side_effect = write_results_resume
@@ -1290,9 +1290,9 @@ class TestReplayCheckpointResume:
             replay_dir = os.path.join(tmpdir, "replay")
             os.makedirs(replay_dir, exist_ok=True)
 
-            # Create an existing per-snapshot result file
+            # Create an existing per-snapshot result file for mr13 strategy
             existing_file = os.path.join(
-                replay_dir, "replay_all_52w_v1_2025-05-02.csv"
+                replay_dir, "replay_mr13_all_52w_v1_2025-05-02.csv"
             )
             pd.DataFrame({"test": [1]}).to_csv(existing_file, index=False)
 
@@ -1469,7 +1469,7 @@ class TestReplayCheckpointResume:
         assert len(s2_errors) == 1
         assert s2_errors[0]["code"] == "sh.600000"
         assert "simulated scan failure" in s2_errors[0]["error_message"]
-        assert mock_write_errors.call_args_list[1][0][4] == "2025-05-09"
+        assert mock_write_errors.call_args_list[1][0][5] == "2025-05-09"
 
         # Both snapshots saved to checkpoint
         assert mock_save_checkpoint.call_count == 2
@@ -1508,13 +1508,13 @@ class TestReplayCheckpointResume:
         mock_write_errors.assert_called_once()
         noop_errors = mock_write_errors.call_args[0][0]
         assert noop_errors == [], "No-op snapshot must call write_replay_errors([])"
-        assert mock_write_errors.call_args[0][4] == "2025-05-09"
+        assert mock_write_errors.call_args[0][5] == "2025-05-09"
 
         # Empty result carrier file is also written
         mock_write_results.assert_called_once()
         noop_results = mock_write_results.call_args[0][0]
         assert noop_results == [], "No-op snapshot must call write_replay_results([])"
-        assert mock_write_results.call_args[0][4] == "2025-05-09"
+        assert mock_write_results.call_args[0][5] == "2025-05-09"
 
         # scan is NOT called (can_run=False)
         strategy.scan.assert_not_called()

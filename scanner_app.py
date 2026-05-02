@@ -153,8 +153,9 @@ def load_or_update_data(
     filename = symbol.replace(".", "_")
     file_path = os.path.join(DATA_DIR, f"{filename}.csv")
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=initial_days)).strftime("%Y-%m-%d")
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    start_date = (now - timedelta(days=initial_days)).strftime("%Y-%m-%d")
     performed_remote_fetch = False
 
     if not os.path.exists(file_path):
@@ -180,12 +181,11 @@ def load_or_update_data(
             return df.tail(lookback_days), performed_remote_fetch
 
         latest_date = pd.to_datetime(local_df["date"]).max()
-        yesterday = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=1)
-        today_timestamp = pd.Timestamp(datetime.now().date())
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_date = now.date()
+        yesterday = pd.Timestamp(today_date) - pd.Timedelta(days=1)
+        today_timestamp = pd.Timestamp(today_date)
+        today_str = today
 
-        # Check if we should force refresh on Friday after 20:00
-        now = datetime.now()
         force_refresh = should_force_refresh_on_friday(now)
 
         if force_refresh:
@@ -841,6 +841,7 @@ _REPLAY_RESULT_COLUMNS = [
 
 def write_replay_results(
     results: List[Dict[str, Any]],
+    strategy_slug: str,
     universe: str,
     lookback_weeks: int,
     version: str,
@@ -854,12 +855,13 @@ def write_replay_results(
 
     Args:
         results: List of replay records to write
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
         snapshot_date: Snapshot date in YYYY-MM-DD format
     """
-    replay_file = get_replay_snapshot_result_path(universe, lookback_weeks, version, snapshot_date)
+    replay_file = get_replay_snapshot_result_path(strategy_slug, universe, lookback_weeks, version, snapshot_date)
 
     if results:
         df = pd.DataFrame(results)
@@ -873,6 +875,7 @@ def write_replay_results(
 
 def write_replay_errors(
     errors: List[Dict[str, Any]],
+    strategy_slug: str,
     universe: str,
     lookback_weeks: int,
     version: str,
@@ -887,12 +890,13 @@ def write_replay_errors(
 
     Args:
         errors: List of error records to write
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
         snapshot_date: Snapshot date in YYYY-MM-DD format
     """
-    error_file = get_replay_snapshot_error_path(universe, lookback_weeks, version, snapshot_date)
+    error_file = get_replay_snapshot_error_path(strategy_slug, universe, lookback_weeks, version, snapshot_date)
 
     if not errors:
         # No errors this run — remove stale error file if it exists
@@ -911,10 +915,11 @@ def write_replay_errors(
     return error_file
 
 
-def get_replay_snapshot_result_path(universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
+def get_replay_snapshot_result_path(strategy_slug: str, universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
     """Return the per-snapshot result file path for a replay experiment.
 
     Args:
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
@@ -923,14 +928,15 @@ def get_replay_snapshot_result_path(universe: str, lookback_weeks: int, version:
     return os.path.join(
         VALIDATION_DIR,
         "replay",
-        f"replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv",
+        f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv",
     )
 
 
-def get_replay_snapshot_error_path(universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
+def get_replay_snapshot_error_path(strategy_slug: str, universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
     """Return the per-snapshot error file path for a replay experiment.
 
     Args:
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
@@ -939,21 +945,29 @@ def get_replay_snapshot_error_path(universe: str, lookback_weeks: int, version: 
     return os.path.join(
         VALIDATION_DIR,
         "replay",
-        f"replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv",
+        f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv",
     )
 
 
-def get_replay_checkpoint_path(universe: str, lookback_weeks: int, version: str) -> str:
-    """Return the checkpoint path for a replay experiment."""
+def get_replay_checkpoint_path(strategy_slug: str, universe: str, lookback_weeks: int, version: str) -> str:
+    """Return the checkpoint path for a replay experiment.
+
+    Args:
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
+        universe: Stock universe identifier
+        lookback_weeks: Number of weeks looked back
+        version: Version identifier
+    """
     return os.path.join(
         VALIDATION_DIR,
         "replay",
-        f"replay_{universe}_{lookback_weeks}w_{version}.checkpoint.json",
+        f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}.checkpoint.json",
     )
 
 
 def _verify_completed_snapshot_files(
     completed_snapshots: List[str],
+    strategy_slug: str,
     universe: str,
     lookback_weeks: int,
     version: str,
@@ -966,6 +980,7 @@ def _verify_completed_snapshot_files(
 
     Args:
         completed_snapshots: List of completed snapshot dates (YYYY-MM-DD)
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
@@ -977,7 +992,7 @@ def _verify_completed_snapshot_files(
 
     for snapshot_date in completed_snapshots:
         result_path = get_replay_snapshot_result_path(
-            universe, lookback_weeks, version, snapshot_date
+            strategy_slug, universe, lookback_weeks, version, snapshot_date
         )
         if not os.path.exists(result_path):
             missing_files.append((snapshot_date, result_path))
@@ -1361,9 +1376,9 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
     - Replay frequency: one run per completed weekly bar
     - Strategy: selected by ``strategy_name`` below
 
-    Output: validation/replay/replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv
+    Output: validation/replay/replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv
             (per-snapshot result files, overwritten on re-run)
-            validation/replay/replay_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv
+            validation/replay/replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv
             (per-snapshot error files, overwritten on re-run)
     """
     logger.info("=" * 60)
@@ -1425,7 +1440,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         replay_data_end_date = (last_snapshot_date + timedelta(weeks=21)).strftime("%Y-%m-%d")
         logger.info("Replay data end date (fixed): %s", replay_data_end_date)
 
-        checkpoint_path = get_replay_checkpoint_path(universe, lookback_weeks, version)
+        checkpoint_path = get_replay_checkpoint_path(strategy_slug, universe, lookback_weeks, version)
 
         completed_snapshots: List[str] = []
         failed_symbols_per_snapshot: Dict[str, List[str]] = {}
@@ -1463,7 +1478,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
             # Verify checkpoint consistency: all completed snapshots must have their result files
             _verify_completed_snapshot_files(
-                completed_snapshots, universe, lookback_weeks, version
+                completed_snapshots, strategy_slug, universe, lookback_weeks, version
             )
 
             # Extract and log any unresolved failed symbols from previous runs.
@@ -1482,17 +1497,19 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             # when there is no checkpoint. The checkpoint is the sole source of truth;
             # per-snapshot CSV files are just result carriers and must not be
             # used to infer completion status or overwrite intent.
+            # Only check files belonging to the current strategy_slug.
             replay_dir = os.path.join(VALIDATION_DIR, "replay")
             if os.path.exists(replay_dir):
                 import glob
                 pattern = os.path.join(
-                    replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_????-??-??*.csv"
+                    replay_dir, f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_????-??-??*.csv"
                 )
                 existing_files = glob.glob(pattern)
                 if existing_files:
                     raise RuntimeError(
-                        "No replay checkpoint found, but existing per-snapshot replay files "
-                        "are already present.  The checkpoint is the sole source of truth "
+                        f"No replay checkpoint found for strategy '{strategy_slug}', "
+                        f"but existing per-snapshot replay files for this strategy are already present.  "
+                        "The checkpoint is the sole source of truth "
                         "for completed snapshots; per-snapshot CSV files are result carriers only "
                         "and cannot be used to infer progress or overwrite intent.  "
                         "Refusing to proceed to avoid inconsistent state.  "
@@ -1571,12 +1588,12 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
                 # Write result carrier file first (even if empty) before checkpoint
                 write_replay_results(
-                    [], universe, lookback_weeks, version, snapshot_date_str
+                    [], strategy_slug, universe, lookback_weeks, version, snapshot_date_str
                 )
 
                 # Clean up any stale error file for this no-op snapshot
                 write_replay_errors(
-                    [], universe, lookback_weeks, version, snapshot_date_str
+                    [], strategy_slug, universe, lookback_weeks, version, snapshot_date_str
                 )
 
                 # Now mark as completed and save checkpoint
@@ -1751,12 +1768,12 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
             # Write per-snapshot result file (even if empty — ensures carrier file exists)
             write_replay_results(
-                snapshot_results, universe, lookback_weeks, version, snapshot_date_str
+                snapshot_results, strategy_slug, universe, lookback_weeks, version, snapshot_date_str
             )
 
             # Write per-snapshot error file (overwrite mode; removes stale file if no errors)
             write_replay_errors(
-                snapshot_errors, universe, lookback_weeks, version, snapshot_date_str
+                snapshot_errors, strategy_slug, universe, lookback_weeks, version, snapshot_date_str
             )
 
             # Only after files are written successfully, mark snapshot as completed
@@ -1805,6 +1822,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
 
 def merge_replay_snapshot_files(
+    strategy_slug: str,
     universe: str,
     lookback_weeks: int,
     version: str,
@@ -1817,6 +1835,7 @@ def merge_replay_snapshot_files(
     into a single CSV file.
 
     Args:
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
@@ -1829,7 +1848,7 @@ def merge_replay_snapshot_files(
 
     replay_dir = os.path.join(VALIDATION_DIR, "replay")
     pattern = os.path.join(
-        replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_????-??-??.csv"
+        replay_dir, f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_????-??-??.csv"
     )
 
     files = sorted(glob.glob(pattern))
@@ -1847,7 +1866,7 @@ def merge_replay_snapshot_files(
 
     if output_path is None:
         output_path = os.path.join(
-            replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_merged.csv"
+            replay_dir, f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_merged.csv"
         )
 
     merged.to_csv(output_path, index=False, encoding="utf-8-sig")
@@ -1857,6 +1876,7 @@ def merge_replay_snapshot_files(
 
 
 def merge_replay_error_snapshot_files(
+    strategy_slug: str,
     universe: str,
     lookback_weeks: int,
     version: str,
@@ -1869,6 +1889,7 @@ def merge_replay_error_snapshot_files(
     into a single CSV file.
 
     Args:
+        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
         universe: Stock universe identifier
         lookback_weeks: Number of weeks looked back
         version: Version identifier
@@ -1881,14 +1902,14 @@ def merge_replay_error_snapshot_files(
 
     replay_dir = os.path.join(VALIDATION_DIR, "replay")
     pattern = os.path.join(
-        replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_????-??-??_errors.csv"
+        replay_dir, f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_????-??-??_errors.csv"
     )
 
     files = sorted(glob.glob(pattern))
     if not files:
         logger.info("No per-snapshot error files found matching: %s", pattern)
         output_path = output_path or os.path.join(
-            replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_errors_merged.csv"
+            replay_dir, f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_errors_merged.csv"
         )
         pd.DataFrame().to_csv(output_path, index=False, encoding="utf-8-sig")
         return output_path
@@ -1904,7 +1925,7 @@ def merge_replay_error_snapshot_files(
 
     if output_path is None:
         output_path = os.path.join(
-            replay_dir, f"replay_{universe}_{lookback_weeks}w_{version}_errors_merged.csv"
+            replay_dir, f"replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_errors_merged.csv"
         )
 
     merged.to_csv(output_path, index=False, encoding="utf-8-sig")
