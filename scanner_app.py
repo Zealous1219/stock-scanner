@@ -13,7 +13,7 @@ import baostock as bs
 import pandas as pd
 
 from config_loader import load_config
-from data_utils import ensure_daily_frame, get_last_trading_day_of_week
+from data_utils import ensure_daily_frame, get_last_trading_day_of_week, get_snapshot_trading_week_info
 from strategy_runtime import StrategyContext, StrategyDecision, StrategyResult
 from strategies import create_strategy_from_config
 
@@ -1290,6 +1290,48 @@ def precompute_weekly_bars_for_replay(full_df: pd.DataFrame) -> pd.DataFrame:
     return convert_daily_to_weekly(full_df, cutoff_date=None)
 
 
+def _guard_snapshot_week_completion(
+    weekly_bars: pd.DataFrame,
+    friday_anchor: pd.Timestamp,
+    snapshot_week_last_trading_day: object,
+) -> pd.DataFrame:
+    """保守守卫：交易日历查询失败时，丢弃快照周最后一根未完成周线。
+    
+    统一主路径与 fallback 路径在 calendar query failure 时的语义：
+    - 若 snapshot_week_last_trading_day 为 None（日历查询失败）
+    - 且最后一根周线锚定在快照周（friday_anchor）
+    - 则保守丢弃该最后一根 bar
+    - 更早历史周线不受影响
+    """
+    if weekly_bars.empty:
+        return weekly_bars
+    # 检查是否有守卫所需字段
+    has_guard_fields = (
+        "trading_days_count" in weekly_bars.columns
+        and "last_daily_date" in weekly_bars.columns
+    )
+    if not has_guard_fields:
+        return weekly_bars
+    last_bar = weekly_bars.iloc[-1]
+    last_bar_date = pd.Timestamp(last_bar["date"])
+    # 最后一根不属于快照周，无需处理
+    if last_bar_date != friday_anchor:
+        return weekly_bars
+    # 最后一根属于快照周，应用守卫逻辑
+    last_trading_day = snapshot_week_last_trading_day
+    if last_trading_day is None:
+        # 日历查询失败，保守丢弃最后一根
+        return weekly_bars.iloc[:-1]
+    # 以下为主路径已有的其他检查（保持行为一致）
+    last_daily_date = pd.Timestamp(last_bar["last_daily_date"])
+    if last_daily_date < pd.Timestamp(last_trading_day):
+        return weekly_bars.iloc[:-1]
+    trading_days_count = int(last_bar["trading_days_count"])
+    if trading_days_count < 3:
+        return weekly_bars.iloc[:-1]
+    return weekly_bars
+
+
 def slice_weekly_bars_for_snapshot(
     weekly_full: pd.DataFrame,
     snapshot_date: datetime,
@@ -1332,35 +1374,7 @@ def slice_weekly_bars_for_snapshot(
     if sliced.empty:
         return sliced
 
-    has_guard_fields = (
-        "trading_days_count" in sliced.columns
-        and "last_daily_date" in sliced.columns
-    )
-    if not has_guard_fields:
-        return sliced
-
-    last_bar = sliced.iloc[-1]
-    last_bar_date = pd.Timestamp(last_bar["date"])
-    if last_bar_date != friday_anchor:
-        return sliced
-
-    last_trading_day = snapshot_week_last_trading_day
-
-    if last_trading_day is None:
-        sliced = sliced.iloc[:-1]
-        return sliced
-
-    last_daily_date = pd.Timestamp(last_bar["last_daily_date"])
-    if last_daily_date < pd.Timestamp(last_trading_day):
-        sliced = sliced.iloc[:-1]
-        return sliced
-
-    trading_days_count = int(last_bar["trading_days_count"])
-    if trading_days_count < 3:
-        sliced = sliced.iloc[:-1]
-        return sliced
-
-    return sliced
+    return _guard_snapshot_week_completion(sliced, friday_anchor, snapshot_week_last_trading_day)
 
 
 def run_weekly_replay_validation(resume: bool = True) -> None:
@@ -1389,16 +1403,18 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
     os.makedirs(VALIDATION_DIR, exist_ok=True)
     os.makedirs(os.path.join(VALIDATION_DIR, "replay"), exist_ok=True)
 
-    stock_pool = "all"
-    strategy_name = "momentum_reversal_13"
+    config = load_config()
+    strategy_name = config.get("strategy", {}).get("name") or "momentum_reversal_13"
     strategy_slug = get_replay_strategy_slug(strategy_name)
 
+    logger.info("Replay strategy: name=%s, slug=%s", strategy_name, strategy_slug)
+
+    stock_pool = "all"
     universe = stock_pool
     lookback_weeks = 52
     version = "v1"
     experiment_tag = f"{strategy_slug}_{universe}_{lookback_weeks}w_{version}"
 
-    config = load_config()
     strategy_config = {
         "name": strategy_name,
         "params": config.get("strategy", {}).get("params", {})
@@ -1565,6 +1581,25 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 snapshot_idx, len(weekly_dates), snapshot_date_str,
             )
 
+            # 输出 snapshot 对应周的 trading-week 元数据（用于语义可解释性）
+            try:
+                week_info = get_snapshot_trading_week_info(snapshot_date)
+                logger.info(
+                    "[Replay] Snapshot %d/%d trading-week info: date=%s, "
+                    "has_trading_day=%s, is_valid=%s, calendar_ok=%s, trading_days=%d",
+                    snapshot_idx, len(weekly_dates), snapshot_date_str,
+                    week_info["has_trading_day"],
+                    week_info["is_valid_completed_trading_week"],
+                    week_info["calendar_query_ok"],
+                    week_info["trading_days_count"],
+                )
+            except Exception as exc:
+                # 元数据查询失败不应影响 replay 主流程
+                logger.debug(
+                    "[Replay] Snapshot %d/%d trading-week info query failed: date=%s error=%s",
+                    snapshot_idx, len(weekly_dates), snapshot_date_str, exc,
+                )
+
             context = StrategyContext(
                 now=snapshot_date,
                 stock_pool=stock_pool,
@@ -1685,12 +1720,25 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         t0 = time.time()
                         current_stage = "scan"
                         if use_weekly_cache and symbol in weekly_full_cache and weekly_full_cache[symbol] is not None:
+                            # Main path: use precomputed weekly cache
                             precomputed_weekly = slice_weekly_bars_for_snapshot(
                                 weekly_full_cache[symbol], snapshot_date,
                                 snapshot_week_last_trading_day,
                             )
                             result = strategy.scan(symbol, df, context, precomputed_weekly=precomputed_weekly)
+                        elif use_weekly_cache:
+                            # Weekly fallback path: weekly strategy but cache unavailable
+                            # Unify with main path by computing weekly bars and applying guard
+                            from data_utils import convert_daily_to_weekly
+                            # Compute full weekly bars from daily data (same as precompute path)
+                            weekly_full = convert_daily_to_weekly(df, cutoff_date=None)
+                            # Slice for snapshot with conservative guard (same as main path)
+                            precomputed_weekly = slice_weekly_bars_for_snapshot(
+                                weekly_full, snapshot_date, snapshot_week_last_trading_day
+                            )
+                            result = strategy.scan(symbol, df, context, precomputed_weekly=precomputed_weekly)
                         else:
+                            # Non-weekly strategy: standard call path, no precomputed_weekly
                             result = strategy.scan(symbol, df, context)
                         stage_times["scan"] = time.time() - t0
                         matched = result.matched

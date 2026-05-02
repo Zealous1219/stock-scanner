@@ -24,6 +24,101 @@ def get_week_monday_friday(target_date: pd.Timestamp) -> tuple[pd.Timestamp, pd.
     return this_week_monday, this_week_friday
 
 
+def get_snapshot_trading_week_info(snapshot_date: datetime | pd.Timestamp) -> dict:
+    """返回 snapshot 对应周的交易日历元数据。
+
+    该函数用于校验历史 snapshot 是否为有效交易周，解决语义可解释性问题：
+    - 当前 generate_weekly_snapshot_dates() 按自然周（每7天）生成历史 snapshot
+    - 若某历史自然周整周休市，仍会生成该周 snapshot
+    - 本函数提供元数据，让 replay/分析时能区分“真实有交易完成的周”与“日历上凑出来的周锚点”
+
+    参数：
+        snapshot_date: 快照日期（通常是周五锚点）
+
+    返回字典包含以下字段：
+        - snapshot_date: 输入的快照日期（pd.Timestamp）
+        - friday_anchor: 同 snapshot_date，明确为周五锚点
+        - week_start_date: 本周周一日期
+        - week_end_date: 本周周五日期
+        - last_trading_day_of_week: 本周最后一个交易日（如果有）
+        - has_trading_day: 本周是否有至少一个交易日
+        - is_valid_completed_trading_week: 是否为有效完成交易周
+        - calendar_query_ok: 交易日历查询是否成功
+        - trading_days_count: 本周交易日数量
+
+    语义说明：
+        - has_trading_day=True 且 calendar_query_ok=True: 本周有实际交易
+        - has_trading_day=False 且 calendar_query_ok=True: 本周整周无交易（如节假日）
+        - calendar_query_ok=False: 交易日历查询失败，状态未知
+        - is_valid_completed_trading_week: 对历史 snapshot，当 has_trading_day=True 时为 True
+    """
+    # 统一转换为 pd.Timestamp 并归一化到日期级（去掉时间分量）
+    snap_ts = pd.Timestamp(snapshot_date).normalize()
+
+    # 获取本周周一和周五
+    week_start_date, week_end_date = get_week_monday_friday(snap_ts)
+
+    # 初始化返回结果
+    result = {
+        "snapshot_date": snap_ts,
+        "friday_anchor": snap_ts,
+        "week_start_date": week_start_date,
+        "week_end_date": week_end_date,
+        "last_trading_day_of_week": None,
+        "has_trading_day": False,
+        "is_valid_completed_trading_week": False,
+        "calendar_query_ok": False,
+        "trading_days_count": 0,
+    }
+
+    # 查询交易日历
+    start_date = week_start_date.strftime("%Y-%m-%d")
+    end_date = week_end_date.strftime("%Y-%m-%d")
+
+    try:
+        rs = bs.query_trade_dates(start_date=start_date, end_date=end_date)
+        if rs.error_code != "0":
+            logger.error(
+                "snapshot交易日历查询失败 - snapshot_date=%s, query_range=[%s, %s], error_code=%s, error_msg=%s",
+                snap_ts.date(),
+                start_date,
+                end_date,
+                rs.error_code,
+                rs.error_msg,
+            )
+            return result  # calendar_query_ok 保持 False
+
+        trading_days = []
+        while rs.next():
+            calendar_date, is_trading_day = rs.get_row_data()
+            if is_trading_day == "1":
+                trading_days.append(pd.Timestamp(calendar_date))
+
+        result["calendar_query_ok"] = True
+        result["trading_days_count"] = len(trading_days)
+
+        if trading_days:
+            result["has_trading_day"] = True
+            result["last_trading_day_of_week"] = max(trading_days)
+            result["is_valid_completed_trading_week"] = True
+        else:
+            # 本周没有交易日（如整周休市）
+            result["has_trading_day"] = False
+            result["is_valid_completed_trading_week"] = False
+
+    except Exception as exc:
+        logger.error(
+            "snapshot交易日历查询异常 - snapshot_date=%s, query_range=[%s, %s], exception=%s",
+            snap_ts.date(),
+            start_date,
+            end_date,
+            exc,
+        )
+        # result 保持默认值的 calendar_query_ok=False
+
+    return result
+
+
 def get_last_trading_day_of_week(target_date: pd.Timestamp) -> pd.Timestamp | None:
     """返回指定日期所在周的最后一个交易日。
 

@@ -9,6 +9,7 @@ from data_utils import (
     get_week_monday_friday,
     get_last_trading_day_of_week,
     get_last_completed_week_end,
+    get_snapshot_trading_week_info,
 )
 
 
@@ -302,3 +303,167 @@ class TestGetLastCompletedWeekEnd:
             result = get_last_completed_week_end(replay_now, daily_latest_date)
             assert result == pd.Timestamp("2026-04-24"), \
                 f"replay anchor: expected this Friday, got {result}"
+
+
+class TestGetSnapshotTradingWeekInfo:
+    """Test get_snapshot_trading_week_info function.
+
+    测试历史 snapshot 的 trading-week 元数据校验能力。
+    这是为改进 weekly replay 历史 snapshot 语义可解释性而新增的 helper。
+    """
+
+    @patch("data_utils.bs.query_trade_dates")
+    def test_historical_week_with_trading_days_is_valid(self, mock_query):
+        """历史 snapshot 周内存在交易日 -> 有效交易周"""
+        # Mock baostock response: 正常交易周（周一到周五都有交易）
+        mock_rs = Mock()
+        mock_rs.error_code = "0"
+        mock_rs.get_row_data.side_effect = [
+            ("2026-04-20", "1"),  # Monday
+            ("2026-04-21", "1"),  # Tuesday
+            ("2026-04-22", "1"),  # Wednesday
+            ("2026-04-23", "1"),  # Thursday
+            ("2026-04-24", "1"),  # Friday
+        ]
+        mock_rs.next.side_effect = [True, True, True, True, True, False]
+        mock_query.return_value = mock_rs
+
+        # snapshot_date 是周五锚点
+        snapshot_date = pd.Timestamp("2026-04-24")
+        result = get_snapshot_trading_week_info(snapshot_date)
+
+        # 验证关键字段
+        assert result["calendar_query_ok"] is True
+        assert result["has_trading_day"] is True
+        assert result["is_valid_completed_trading_week"] is True
+        assert result["last_trading_day_of_week"] == pd.Timestamp("2026-04-24")
+        assert result["trading_days_count"] == 5
+        assert result["week_start_date"] == pd.Timestamp("2026-04-20")
+        assert result["week_end_date"] == pd.Timestamp("2026-04-24")
+        assert result["snapshot_date"] == snapshot_date
+        assert result["friday_anchor"] == snapshot_date
+
+    @patch("data_utils.bs.query_trade_dates")
+    def test_historical_week_with_no_trading_days_is_invalid(self, mock_query):
+        """历史 snapshot 整周无交易 -> 无效交易周"""
+        # Mock baostock response: 整周无交易（如节假日）
+        mock_rs = Mock()
+        mock_rs.error_code = "0"
+        mock_rs.get_row_data.side_effect = [
+            ("2026-04-20", "0"),  # Monday (holiday)
+            ("2026-04-21", "0"),  # Tuesday (holiday)
+            ("2026-04-22", "0"),  # Wednesday (holiday)
+            ("2026-04-23", "0"),  # Thursday (holiday)
+            ("2026-04-24", "0"),  # Friday (holiday)
+        ]
+        mock_rs.next.side_effect = [True, True, True, True, True, False]
+        mock_query.return_value = mock_rs
+
+        snapshot_date = pd.Timestamp("2026-04-24")
+        result = get_snapshot_trading_week_info(snapshot_date)
+
+        # 验证关键字段：整周无交易
+        assert result["calendar_query_ok"] is True
+        assert result["has_trading_day"] is False
+        assert result["is_valid_completed_trading_week"] is False
+        assert result["last_trading_day_of_week"] is None
+        assert result["trading_days_count"] == 0
+
+    @patch("data_utils.bs.query_trade_dates")
+    def test_calendar_query_failure_returns_conservative_state(self, mock_query):
+        """交易日历查询失败 -> 返回明确保守状态"""
+        # Mock baostock response: 查询失败
+        mock_rs = Mock()
+        mock_rs.error_code = "1"  # Error
+        mock_rs.error_msg = "Network error"
+        mock_query.return_value = mock_rs
+
+        snapshot_date = pd.Timestamp("2026-04-24")
+        result = get_snapshot_trading_week_info(snapshot_date)
+
+        # 验证关键字段：查询失败，保守处理
+        assert result["calendar_query_ok"] is False
+        assert result["has_trading_day"] is False
+        assert result["is_valid_completed_trading_week"] is False
+        assert result["last_trading_day_of_week"] is None
+        assert result["trading_days_count"] == 0
+
+    @patch("data_utils.bs.query_trade_dates")
+    def test_short_trading_week(self, mock_query):
+        """短周（如周四为最后交易日）的处理"""
+        # Mock baostock response: 短周（周五休市）
+        mock_rs = Mock()
+        mock_rs.error_code = "0"
+        mock_rs.get_row_data.side_effect = [
+            ("2026-04-20", "1"),  # Monday
+            ("2026-04-21", "1"),  # Tuesday
+            ("2026-04-22", "1"),  # Wednesday
+            ("2026-04-23", "1"),  # Thursday (last trading day)
+            ("2026-04-24", "0"),  # Friday (holiday)
+        ]
+        mock_rs.next.side_effect = [True, True, True, True, True, False]
+        mock_query.return_value = mock_rs
+
+        snapshot_date = pd.Timestamp("2026-04-24")
+        result = get_snapshot_trading_week_info(snapshot_date)
+
+        # 验证关键字段：短周但有效
+        assert result["calendar_query_ok"] is True
+        assert result["has_trading_day"] is True
+        assert result["is_valid_completed_trading_week"] is True
+        assert result["last_trading_day_of_week"] == pd.Timestamp("2026-04-23")  # Thursday
+        assert result["trading_days_count"] == 4
+
+    def test_input_datetime_type(self):
+        """测试输入为 datetime 类型时也能正确处理"""
+        with patch("data_utils.bs.query_trade_dates") as mock_query:
+            mock_rs = Mock()
+            mock_rs.error_code = "0"
+            mock_rs.get_row_data.side_effect = [
+                ("2026-04-20", "1"),
+                ("2026-04-21", "1"),
+                ("2026-04-22", "1"),
+                ("2026-04-23", "1"),
+                ("2026-04-24", "1"),
+            ]
+            mock_rs.next.side_effect = [True, True, True, True, True, False]
+            mock_query.return_value = mock_rs
+
+            # 输入为 datetime 类型
+            snapshot_date = datetime(2026, 4, 24)
+            result = get_snapshot_trading_week_info(snapshot_date)
+
+            assert result["calendar_query_ok"] is True
+            assert result["has_trading_day"] is True
+            assert result["snapshot_date"] == pd.Timestamp("2026-04-24")
+
+    def test_pd_timestamp_input_is_normalized(self):
+        """测试 pd.Timestamp 输入（带时间分量）会被归一化到日期级"""
+        with patch("data_utils.bs.query_trade_dates") as mock_query:
+            mock_rs = Mock()
+            mock_rs.error_code = "0"
+            mock_rs.get_row_data.side_effect = [
+                ("2026-04-20", "1"),
+                ("2026-04-21", "1"),
+                ("2026-04-22", "1"),
+                ("2026-04-23", "1"),
+                ("2026-04-24", "1"),
+            ]
+            mock_rs.next.side_effect = [True, True, True, True, True, False]
+            mock_query.return_value = mock_rs
+
+            # 输入为 pd.Timestamp，带时间分量（如 replay 中的 snapshot_date）
+            snapshot_date = pd.Timestamp("2026-04-24 23:59:59")
+            result = get_snapshot_trading_week_info(snapshot_date)
+
+            # 验证：snapshot_date 和 friday_anchor 应该归一化到日期级（时间部分为 00:00:00）
+            expected_date = pd.Timestamp("2026-04-24")  # 日期级，无时间分量
+            assert result["snapshot_date"] == expected_date
+            assert result["friday_anchor"] == expected_date
+            # 验证时间分量确实被去掉了
+            assert result["snapshot_date"].hour == 0
+            assert result["snapshot_date"].minute == 0
+            assert result["snapshot_date"].second == 0
+            # 其他字段语义不变
+            assert result["calendar_query_ok"] is True
+            assert result["has_trading_day"] is True

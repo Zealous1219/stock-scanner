@@ -734,3 +734,78 @@ class TestReplayStrategySlug:
 
     def test_black_horse_uses_strategy_name_as_replay_slug(self):
         assert get_replay_strategy_slug("black_horse") == "black_horse"
+
+
+class TestGenerateWeeklySnapshotDatesOutputShape:
+    """Test that generate_weekly_snapshot_dates() output shape remains unchanged."""
+
+    def test_returns_list_of_datetime(self):
+        """验证返回类型是 List[datetime]"""
+        from scanner_app import generate_weekly_snapshot_dates
+
+        with patch("scanner_app.get_last_trading_day_of_week") as mock_get_last:
+            # Mock: 假设本周最后交易日是周五
+            mock_get_last.return_value = pd.Timestamp("2026-04-24")
+
+            result = generate_weekly_snapshot_dates(lookback_weeks=4)
+
+            # 验证返回类型是 list
+            assert isinstance(result, list)
+            # 验证所有元素都是 datetime
+            for item in result:
+                assert isinstance(item, datetime)
+            # 验证数量正确
+            assert len(result) == 4
+
+    def test_returns_friday_anchored_datetimes(self):
+        """验证返回的都是周五锚点，且时间设为 23:59:59"""
+        from scanner_app import generate_weekly_snapshot_dates
+
+        with patch("scanner_app.get_last_trading_day_of_week") as mock_get_last:
+            mock_get_last.return_value = pd.Timestamp("2026-04-24")
+
+            result = generate_weekly_snapshot_dates(lookback_weeks=4)
+
+            # 验证所有日期都是周五（weekday=4）
+            for dt in result:
+                assert dt.weekday() == 4  # Friday
+                assert dt.hour == 23
+                assert dt.minute == 59
+                assert dt.second == 59
+
+    def test_dates_are_sorted_ascending(self):
+        """验证日期是升序排列的"""
+        from scanner_app import generate_weekly_snapshot_dates
+
+        with patch("scanner_app.get_last_trading_day_of_week") as mock_get_last:
+            mock_get_last.return_value = pd.Timestamp("2026-04-24")
+
+            result = generate_weekly_snapshot_dates(lookback_weeks=10)
+
+            # 验证日期是升序的
+            for i in range(len(result) - 1):
+                assert result[i] < result[i + 1]
+
+    def test_output_shape_unchanged_by_trading_week_info_feature(self):
+        """验证新增的 get_snapshot_trading_week_info 功能没有影响输出结构。
+
+        这个测试确保即使新增了 trading week 元数据功能，
+        generate_weekly_snapshot_dates() 仍然返回简单的 datetime 列表。
+        """
+        from scanner_app import generate_weekly_snapshot_dates
+
+        # 直接调用，不 mock（或者 mock 必要的部分）
+        # 这里我们主要验证返回类型，不关心具体日期
+        with patch("scanner_app.get_last_trading_day_of_week") as mock_get_last:
+            mock_get_last.return_value = pd.Timestamp("2026-04-24")
+
+            result = generate_weekly_snapshot_dates(lookback_weeks=5)
+
+            # 关键验证：返回的不是复杂对象列表，而是 datetime 列表
+            assert isinstance(result, list)
+            for item in result:
+                # 应该是简单的 datetime，而不是 dict 或带有元数据的对象
+                assert isinstance(item, datetime)
+                # 确保不是 dict
+                assert not isinstance(item, dict)
+        assert get_replay_strategy_slug("black_horse") == "black_horse"

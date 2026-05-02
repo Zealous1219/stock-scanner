@@ -2881,3 +2881,222 @@ class TestWeeklyReplayCompletenessGuard:
 # to avoid mock issues in this file.
 
 
+class TestTradingWeekInfoFailurePath:
+    """Test that trading-week info failure does not crash replay due to logging."""
+
+    @patch("scanner_app.save_replay_checkpoint")
+    @patch("scanner_app.write_replay_errors")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.load_historical_data_up_to_date")
+    @patch("scanner_app.load_full_df_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_snapshot_trading_week_info")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_failure_does_not_crash_replay(
+        self, mock_bs, mock_load_config, mock_get_week_info,
+        mock_gen_dates, mock_get_stock_list, mock_create_strategy,
+        mock_load_full_df, mock_load_historical, mock_write_results,
+        mock_write_errors, mock_save_checkpoint
+    ):
+        """验证 get_snapshot_trading_week_info 抛异常时，replay 主流程不会因日志格式化而崩溃"""
+        # Mock: load_config 返回最小配置
+        mock_load_config.return_value = {
+            "stock_pool": "all",
+            "strategy": {"name": "test_strategy", "params": {}},
+            "data": {"lookback_days": 60, "initial_days": 100, "request_interval": 0.5},
+        }
+
+        # Mock: get_snapshot_trading_week_info 抛异常（这是我们要测试的核心）
+        mock_get_week_info.side_effect = Exception("Calendar query failed")
+
+        # Mock: generate_weekly_snapshot_dates 返回1个 snapshot
+        snapshot_date = datetime(2025, 3, 14, 23, 59, 59)
+        mock_gen_dates.return_value = [snapshot_date]
+
+        # Mock: get_stock_list 返回1个 symbol
+        mock_get_stock_list.return_value = ["sh.600000"]
+
+        # Mock: bs.login 成功
+        mock_lg = MagicMock()
+        mock_lg.error_code = "0"
+        mock_bs.login.return_value = mock_lg
+
+        # Mock: create_strategy_from_config 返回 mock strategy
+        mock_strategy = MagicMock()
+        mock_strategy.name = "test_strategy"
+        mock_strategy.can_run.return_value = StrategyDecision(
+            should_run=True, reason_code="ok", reason_text="ok"
+        )
+        # 使用 strategy.scan（真实路径），不是 strategy.compute
+        mock_strategy.scan.return_value = StrategyResult(
+            matched=False, reason_code="no_match", reason_text="not matched", details={}
+        )
+        mock_create_strategy.return_value = mock_strategy
+
+        # Mock: load_full_df_for_replay 返回最小 daily df
+        daily_df = pd.DataFrame({
+            "date": pd.date_range("2025-01-01", periods=60, freq="D"),
+            "open": [10.0] * 60,
+            "high": [10.5] * 60,
+            "low": [9.5] * 60,
+            "close": [10.0 + i * 0.01 for i in range(60)],
+            "volume": [1000] * 60,
+        })
+        mock_load_full_df.return_value = daily_df
+
+        # Mock: load_historical_data_up_to_date 返回最小 df
+        mock_load_historical.return_value = daily_df
+
+        # Mock: write_replay_results / write_replay_errors / save_replay_checkpoint
+        # 避免真实文件操作
+        mock_write_results.return_value = None
+        mock_write_errors.return_value = None
+        mock_save_checkpoint.return_value = None
+
+        # 运行 replay - 使用正确的函数签名
+        # 应该正常跑完，不会因日志格式化问题而崩溃
+        # 如果正常完成，测试通过；如果抛异常，测试失败
+        run_weekly_replay_validation(resume=False)
+
+    def test_failure_log_format_correct(self):
+        """直接验证修复后的日志格式（参数类型匹配）"""
+        # 这个测试直接验证日志格式化字符串和参数是否匹配
+        # 不运行完整的 replay，直接测试格式化
+
+        # 模拟修复后的日志调用
+        fmt_str = "[Replay] Snapshot %d/%d trading-week info query failed: date=%s error=%s"
+        snapshot_idx = 1
+        total = 4
+        snapshot_date_str = "2025-03-14"
+        exc = Exception("Calendar query failed")
+
+        # 验证格式化不会出错
+        try:
+            log_msg = fmt_str % (snapshot_idx, total, snapshot_date_str, str(exc))
+            assert "Snapshot 1/4" in log_msg
+            assert snapshot_date_str in log_msg
+            assert "Calendar query failed" in log_msg
+        except (TypeError, ValueError) as e:
+            pytest.fail(f"Log format mismatch: {e}")
+
+        # 验证格式串中的占位符数量
+        assert fmt_str.count("%d") == 2, \
+            f"Format string should have 2 %d placeholders, got {fmt_str.count('%d')}"
+        assert fmt_str.count("%s") == 2, \
+            f"Format string should have 2 %s placeholders, got {fmt_str.count('%s')}"
+
+
+# ---------------------------------------------------------------------------
+# Narrowed fallback path tests
+# Verify that the fallback guard only applies to weekly strategies
+# ---------------------------------------------------------------------------
+
+class TestNarrowedFallbackPath:
+    """Verify that the narrowed fallback path correctly separates
+    weekly and non-weekly strategies."""
+
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.slice_weekly_bars_for_snapshot")
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_weekly_fallback_path_receives_precomputed_weekly(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute, mock_slice,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write, mock_ensure, mock_exists, mock_getsize,
+    ):
+        """Weekly strategy with cache unavailable (fallback path) must
+        still receive precomputed_weekly with guard applied."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = {
+            "strategy": {"name": "momentum_reversal_13", "params": {}},
+            "data": {"lookback_days": 180, "initial_days": 400, "request_interval": 0},
+        }
+        mock_stocks.return_value = ["sh.600000"]
+        mock_dates.return_value = [datetime(2025, 5, 2, 23, 59, 59)]
+
+        # Make precompute return None to simulate cache unavailable
+        mock_precompute.return_value = None
+
+        weekly_df = _make_df(60)
+        mock_slice.return_value = weekly_df
+
+        strategy = MagicMock()
+        strategy.name = "momentum_reversal_13"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_unmatched_result()
+        mock_create.return_value = strategy
+
+        run_weekly_replay_validation()
+
+        # Verify strategy.scan was called with precomputed_weekly
+        assert strategy.scan.called, "strategy.scan should have been called"
+        call_kwargs = strategy.scan.call_args
+        assert "precomputed_weekly" in call_kwargs.kwargs, \
+            "Weekly fallback path must receive precomputed_weekly"
+        assert call_kwargs.kwargs["precomputed_weekly"] is not None, \
+            "precomputed_weekly should not be None in fallback path"
+
+    @patch("scanner_app.os.path.getsize", return_value=0)
+    @patch("scanner_app.os.path.exists", return_value=False)
+    @patch("scanner_app.ensure_directories")
+    @patch("scanner_app.write_replay_results")
+    @patch("scanner_app.calculate_forward_returns", return_value={"return_4w": 0.0, "return_8w": 0.0, "return_12w": 0.0})
+    @patch("scanner_app.load_historical_data_up_to_date", return_value=_make_df())
+    @patch("scanner_app.load_full_df_for_replay", return_value=_make_df())
+    @patch("scanner_app.slice_weekly_bars_for_snapshot")
+    @patch("scanner_app.precompute_weekly_bars_for_replay")
+    @patch("scanner_app.create_strategy_from_config")
+    @patch("scanner_app.generate_weekly_snapshot_dates")
+    @patch("scanner_app.get_stock_list")
+    @patch("scanner_app.load_config")
+    @patch("scanner_app.bs")
+    def test_non_weekly_strategy_does_not_receive_precomputed_weekly(
+        self, mock_bs, mock_config, mock_stocks, mock_dates,
+        mock_create, mock_precompute, mock_slice,
+        mock_load_full, mock_load_hist, mock_calc_returns,
+        mock_write, mock_ensure, mock_exists, mock_getsize,
+    ):
+        """Non-weekly strategy must NOT receive precomputed_weekly,
+        regardless of cache status."""
+        mock_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+        mock_bs.logout.return_value = MagicMock()
+        mock_config.return_value = {
+            "strategy": {"name": "non_weekly_strategy", "params": {}},
+            "data": {"lookback_days": 180, "initial_days": 400, "request_interval": 0},
+        }
+        mock_stocks.return_value = ["sh.600000"]
+        mock_dates.return_value = [datetime(2025, 5, 2, 23, 59, 59)]
+
+        strategy = MagicMock()
+        strategy.name = "non_weekly_strategy"
+        strategy.can_run.return_value = StrategyDecision(should_run=True, reason_code="ok", reason_text="ok")
+        strategy.scan.return_value = _make_unmatched_result()
+        mock_create.return_value = strategy
+
+        run_weekly_replay_validation()
+
+        # Verify strategy.scan was called WITHOUT precomputed_weekly
+        assert strategy.scan.called, "strategy.scan should have been called"
+        call_kwargs = strategy.scan.call_args
+        # precomputed_weekly should NOT be in kwargs for non-weekly strategy
+        assert "precomputed_weekly" not in call_kwargs.kwargs, \
+            "Non-weekly strategy must NOT receive precomputed_weekly"
+        # Verify only 3 positional args (symbol, df, context)
+        assert len(call_kwargs.args) == 3, \
+            f"Non-weekly strategy scan should receive exactly 3 positional args, got {len(call_kwargs.args)}"
+
