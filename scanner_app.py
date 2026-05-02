@@ -995,6 +995,37 @@ def _verify_completed_snapshot_files(
         )
 
 
+def _summarize_failed_symbols(failed_symbols_per_snapshot: Dict[str, List[str]]) -> str:
+    """Build a human-readable summary of unresolved failed symbols.
+
+    Returns a log-ready string or empty string when there are no unresolved
+    failures.  Shows the total snapshot/symbol counts and up to 5 example
+    snapshots with the first few failed symbols each.
+
+    Args:
+        failed_symbols_per_snapshot: dict of snapshot_date → failed symbols.
+    """
+    if not failed_symbols_per_snapshot:
+        return ""
+    total_snapshots = len(failed_symbols_per_snapshot)
+    total_symbols = sum(len(v) for v in failed_symbols_per_snapshot.values())
+    lines = [
+        "[Replay] Unresolved failed symbols: "
+        f"{total_snapshots} snapshot(s) with {total_symbols} total failed symbol(s)",
+    ]
+    for i, (snap, syms) in enumerate(sorted(failed_symbols_per_snapshot.items())):
+        if i >= 5:
+            remaining = total_snapshots - 5
+            if remaining > 0:
+                lines.append(f"  ... and {remaining} more snapshot(s)")
+            break
+        syms_preview = ", ".join(syms[:3])
+        if len(syms) > 3:
+            syms_preview += f", ... ({len(syms)} total)"
+        lines.append(f"  [{snap}] {syms_preview}")
+    return "\n".join(lines)
+
+
 def load_replay_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
     """Load a replay checkpoint from JSON."""
     with open(checkpoint_path, "r", encoding="utf-8") as f:
@@ -1102,6 +1133,28 @@ def validate_replay_checkpoint(
     if not isinstance(completed_snapshots, list) or any(not isinstance(item, str) for item in completed_snapshots):
         raise RuntimeError("Replay checkpoint has invalid completed_snapshots; expected a list of YYYY-MM-DD strings")
 
+    # Validate failed_symbols_per_snapshot if present.
+    # This is a quality/omission truth (NOT a progress blocker).
+    # A completed snapshot MAY have failed symbols — this is a valid state.
+    failed_symbols = checkpoint.get("failed_symbols_per_snapshot")
+    if failed_symbols is not None:
+        if not isinstance(failed_symbols, dict):
+            raise RuntimeError(
+                "Replay checkpoint has invalid 'failed_symbols_per_snapshot'; "
+                "expected a dict[str, list[str]]"
+            )
+        for key, value in failed_symbols.items():
+            if not isinstance(key, str):
+                raise RuntimeError(
+                    "Replay checkpoint has invalid 'failed_symbols_per_snapshot'; "
+                    "all keys must be strings (YYYY-MM-DD snapshot dates)"
+                )
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise RuntimeError(
+                    "Replay checkpoint has invalid 'failed_symbols_per_snapshot'; "
+                    "all values must be lists of strings (symbol codes)"
+                )
+
     return completed_snapshots
 
 
@@ -1114,6 +1167,7 @@ def save_replay_checkpoint(
     completed_snapshots: List[str],
     snapshot_dates: List[str],
     replay_data_end_date: str | None = None,
+    failed_symbols_per_snapshot: Dict[str, List[str]] | None = None,
 ) -> None:
     """Persist replay checkpoint JSON for snapshot-level resume.
 
@@ -1124,6 +1178,10 @@ def save_replay_checkpoint(
     ``replay_data_end_date`` fixes the data boundary for replay so that
     the same experiment always uses identical data, regardless of when
     the replay is resumed.
+
+    ``failed_symbols_per_snapshot`` is the structured record of which
+    symbols failed in each completed snapshot.  It is a quality/omission
+    truth, NOT a progress blocker.
     """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     checkpoint: Dict[str, Any] = {
@@ -1138,6 +1196,9 @@ def save_replay_checkpoint(
 
     if replay_data_end_date is not None:
         checkpoint["replay_data_end_date"] = replay_data_end_date
+
+    if failed_symbols_per_snapshot is not None and failed_symbols_per_snapshot:
+        checkpoint["failed_symbols_per_snapshot"] = failed_symbols_per_snapshot
 
     if os.path.exists(checkpoint_path):
         existing_checkpoint = load_replay_checkpoint(checkpoint_path)
@@ -1367,6 +1428,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         checkpoint_path = get_replay_checkpoint_path(universe, lookback_weeks, version)
 
         completed_snapshots: List[str] = []
+        failed_symbols_per_snapshot: Dict[str, List[str]] = {}
         run_mode = "fresh"
         resume_replay_data_end_date = None
 
@@ -1403,6 +1465,13 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             _verify_completed_snapshot_files(
                 completed_snapshots, universe, lookback_weeks, version
             )
+
+            # Extract and log any unresolved failed symbols from previous runs.
+            # These are quality/omission records — they do NOT block resume.
+            failed_symbols_per_snapshot = checkpoint.get("failed_symbols_per_snapshot", {})
+            if failed_symbols_per_snapshot:
+                summary = _summarize_failed_symbols(failed_symbols_per_snapshot)
+                logger.warning(summary)
 
             run_mode = "resume"
         elif resume:
@@ -1514,10 +1583,12 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 completed_snapshot_set.add(snapshot_date_str)
                 completed_snapshots.append(snapshot_date_str)
                 completed_snapshots.sort()
+                failed_symbols_per_snapshot.pop(snapshot_date_str, None)
                 save_replay_checkpoint(
                     checkpoint_path, experiment_tag, universe, lookback_weeks, version,
                     completed_snapshots.copy(), snapshot_dates_str,
                     replay_data_end_date=replay_data_end_date,
+                    failed_symbols_per_snapshot=failed_symbols_per_snapshot,
                 )
                 continue
 
@@ -1525,6 +1596,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             processed_count = 0
             failed_count = 0
             snapshot_errors = []
+            snapshot_failed_symbols: List[str] = []
 
             snapshot_week_last_trading_day = None
             if use_weekly_cache:
@@ -1623,6 +1695,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 except Exception as exc:
                     symbol_failed = True
                     failed_count += 1
+                    snapshot_failed_symbols.append(symbol)
 
                     # Log error
                     logger.error(
@@ -1691,6 +1764,14 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             completed_snapshots.append(snapshot_date_str)
             completed_snapshots.sort()
 
+            # Update failed_symbols_per_snapshot: record failed symbols or clear stale entry
+            if snapshot_failed_symbols:
+                failed_symbols_per_snapshot[snapshot_date_str] = sorted(
+                    list(set(snapshot_failed_symbols))
+                )
+            else:
+                failed_symbols_per_snapshot.pop(snapshot_date_str, None)
+
             logger.info(
                 "[Replay] Snapshot %d/%d done: date=%s elapsed=%.1fs "
                 "processed=%d matched=%d failed=%d",
@@ -1708,7 +1789,13 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 completed_snapshots.copy(),
                 snapshot_dates_str,
                 replay_data_end_date=replay_data_end_date,
+                failed_symbols_per_snapshot=failed_symbols_per_snapshot,
             )
+
+        # Log unresolved failure summary at replay end
+        if failed_symbols_per_snapshot:
+            summary = _summarize_failed_symbols(failed_symbols_per_snapshot)
+            logger.warning(summary)
 
         logger.info("Weekly replay validation completed.")
 
