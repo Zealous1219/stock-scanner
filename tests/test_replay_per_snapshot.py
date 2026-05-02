@@ -258,7 +258,9 @@ class TestCheckpointUpdateTiming:
 
         with patch("scanner_app.write_replay_results", side_effect=track_write_results):
             with patch("scanner_app.write_replay_errors"):
-                run_weekly_replay_validation()
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                        run_weekly_replay_validation()
 
         assert "write_results" in call_order
         assert "save_checkpoint" in call_order
@@ -329,7 +331,9 @@ class TestResumeSkipsCompleted:
         }
 
         with patch("scanner_app.load_replay_checkpoint", return_value=checkpoint_data):
-            run_weekly_replay_validation()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
 
         write_calls = mock_write_results.call_args_list
         assert len(write_calls) == 1
@@ -425,7 +429,9 @@ class TestInconsistentStateDetection:
 
         with patch("scanner_app.load_replay_checkpoint", return_value=checkpoint_data):
             with pytest.raises(RuntimeError, match="result files are missing"):
-                run_weekly_replay_validation()
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                        run_weekly_replay_validation()
 
 
 # ---------------------------------------------------------------------------

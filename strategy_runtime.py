@@ -1,4 +1,4 @@
-"""Runtime data structures shared by the scanner and strategies."""
+"""运行时数据结构：Context / Decision / Result。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any, Dict
 
 @dataclass(frozen=True)
 class StrategyContext:
-    """Runtime context shared with each strategy."""
+    """策略运行时上下文。"""
 
     now: datetime
     stock_pool: str
@@ -18,7 +18,7 @@ class StrategyContext:
 
 @dataclass(frozen=True)
 class StrategyDecision:
-    """Whether a strategy should run for the current invocation."""
+    """策略是否应执行本次扫描。"""
 
     should_run: bool
     reason_code: str
@@ -27,7 +27,7 @@ class StrategyDecision:
 
 @dataclass(frozen=True)
 class StrategyResult:
-    """Structured scan result for a single symbol."""
+    """单标的扫描结果。"""
 
     matched: bool
     reason_code: str

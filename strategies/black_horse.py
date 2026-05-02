@@ -1,4 +1,12 @@
-"""Black horse weekly preparation strategy."""
+"""Black Horse 周线准备策略。
+
+检测规则（最近 3 根已完成周线）：
+  1. 全部阳线（close > open）
+  2. 实体涨幅严格递增
+  3. 成交量严格递增
+
+作者: zealous
+"""
 
 from __future__ import annotations
 
@@ -12,7 +20,7 @@ from strategies.base import BaseStrategy
 
 
 class BlackHorseStrategy(BaseStrategy):
-    """Find symbols with three increasingly strong completed weekly candles."""
+    """检测最近三周阳线且涨幅/成交量递增。"""
 
     DEFAULT_PARAMS = {
         "required_weeks": 3,
@@ -26,7 +34,6 @@ class BlackHorseStrategy(BaseStrategy):
     def _validate_params(self) -> None:
         if self.required_weeks != 3:
             raise ValueError("black_horse currently requires exactly 3 completed weekly bars")
-
         if self.min_weekly_bars < self.required_weeks:
             raise ValueError("min_weekly_bars must be >= required_weeks")
 
@@ -41,17 +48,13 @@ class BlackHorseStrategy(BaseStrategy):
         return StrategyDecision(
             should_run=True,
             reason_code="completed_weekly_bars_only",
-            reason_text=(
-                "Black horse strategy uses the latest three completed weekly bars "
-                "and ignores the current unfinished week."
-            ),
+            reason_text="Black horse uses the latest three completed weekly bars only.",
         )
 
     def _build_result_details(self, latest_weeks: pd.DataFrame) -> Dict[str, Any]:
         enriched = latest_weeks.copy()
         enriched["body_gain"] = enriched.apply(self._weekly_body_gain, axis=1)
         enriched["week_end"] = pd.to_datetime(enriched["date"]).dt.strftime("%Y-%m-%d")
-
         return {
             "signal_type": "black_horse_ready",
             "signal_date": enriched.iloc[-1]["week_end"],
@@ -74,11 +77,6 @@ class BlackHorseStrategy(BaseStrategy):
         context: StrategyContext,
         precomputed_weekly: pd.DataFrame | None = None,
     ) -> StrategyResult:
-        # Weekly-strategy replay optimization v1:
-        # If the caller (replay loop) has already pre-sliced the completed
-        # weekly bars for this snapshot, use them directly to skip the
-        # daily→weekly resample.  The normal scanner path passes None and
-        # falls through to the standard get_completed_weekly_bars call.
         if precomputed_weekly is not None:
             weekly = precomputed_weekly
         else:
@@ -88,7 +86,7 @@ class BlackHorseStrategy(BaseStrategy):
             return StrategyResult(
                 matched=False,
                 reason_code="insufficient_weekly_bars",
-                reason_text="Not enough completed weekly bars to evaluate the black horse strategy.",
+                reason_text="Not enough completed weekly bars.",
                 details={"available_weeks": int(len(weekly))},
             )
 
@@ -107,30 +105,27 @@ class BlackHorseStrategy(BaseStrategy):
             return StrategyResult(
                 matched=False,
                 reason_code="weekly_candle_not_bullish",
-                reason_text="At least one of the latest three completed weekly candles is not bullish.",
+                reason_text="At least one of the latest three weekly candles is not bullish.",
                 details=details,
             )
-
         if not gains_expanding:
             return StrategyResult(
                 matched=False,
                 reason_code="body_gain_not_expanding",
-                reason_text="The latest three completed weekly body gains are not strictly increasing.",
+                reason_text="Body gains are not strictly increasing.",
                 details=details,
             )
-
         if not volumes_expanding:
             return StrategyResult(
                 matched=False,
                 reason_code="weekly_volume_not_expanding",
-                reason_text="The latest three completed weekly volumes are not strictly increasing.",
+                reason_text="Volumes are not strictly increasing.",
                 details=details,
             )
-
         return StrategyResult(
             matched=True,
             reason_code="matched",
-            reason_text="Symbol is in black horse preparation state based on completed weekly bars.",
+            reason_text="Black horse preparation state detected.",
             details=details,
         )
 

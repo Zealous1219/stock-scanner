@@ -24,8 +24,7 @@
         'volume_ratio': 1.5
     })
 
-作者: AI Assistant
-日期: 2026-03-28
+作者: zealous
 """
 
 from typing import Dict, Any, List

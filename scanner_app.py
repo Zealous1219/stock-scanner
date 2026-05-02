@@ -1,4 +1,4 @@
-"""Config-driven stock scanner application."""
+"""Config-driven stock scanner application. 入口及 replay 验证框架。"""
 
 from __future__ import annotations
 
@@ -31,21 +31,18 @@ VALIDATION_DIR = "validation"
 
 
 def ensure_directories() -> None:
-    """Create necessary directories if they don't exist."""
+    """创建 data/ 和 output/ 目录。"""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def should_force_refresh_on_friday(now: datetime) -> bool:
-    """Check if we should force refresh data on Friday after 20:00.
-
-    Returns True if it's Friday after 20:00, False otherwise.
-    """
-    return now.weekday() == 4 and now.hour >= 20  # Friday (weekday 4) after 20:00
+    """周五 20:00 后强制刷新数据。"""
+    return now.weekday() == 4 and now.hour >= 20
 
 
 def get_latest_trading_day(reference_time: datetime | None = None, lookback_days: int = 14) -> str:
-    """Return the latest trading day on or before the reference date."""
+    """返回参考日期前最近的一个交易日（含参考日期）。"""
     if reference_time is None:
         reference_time = datetime.now()
 
@@ -99,7 +96,6 @@ def get_stock_list(stock_pool: str) -> List[str]:
 
     df = pd.DataFrame(data_list, columns=rs.fields)
 
-    # 记录实际获取的股票数量
     logger.info("Fetched %s stocks for %s", len(df), pool_name)
 
     # 数量校验
@@ -150,6 +146,10 @@ def load_or_update_data(
     initial_days: int,
     request_interval: float,
 ) -> Tuple[pd.DataFrame | None, bool]:
+    """加载或刷新 symbol 日线缓存。按需远程拉取。
+
+    Returns: (df, performed_remote_fetch)
+    """
     filename = symbol.replace(".", "_")
     file_path = os.path.join(DATA_DIR, f"{filename}.csv")
 
@@ -189,13 +189,11 @@ def load_or_update_data(
         force_refresh = should_force_refresh_on_friday(now)
 
         if force_refresh:
-            # Friday after 20:00: only refresh if we don't have today's data
+            # 周五 20:00 后，如果已有当日数据则直接用缓存
             if latest_date >= today_timestamp:
-                # Already have today's data, use cache
                 return local_df.tail(lookback_days), performed_remote_fetch
-            # Otherwise, proceed to fetch new data
         elif latest_date >= yesterday:
-            # Not Friday after 20:00, use normal cache logic
+            # 非周末强制刷新，用正常缓存逻辑
             return local_df.tail(lookback_days), performed_remote_fetch
 
         new_data = fetch_historical_data(symbol, latest_date.strftime("%Y-%m-%d"), today_str)
@@ -275,7 +273,8 @@ def write_candidates(strategy_name: str, results: List[Dict[str, Any]]) -> str:
     pd.DataFrame(results).to_csv(output_file, index=False, encoding="utf-8-sig")
     return output_file
 
-#### 主入口  
+
+#### 主入口
 def main() -> None:
     ensure_directories()
     logger.info("=" * 60)
@@ -286,8 +285,7 @@ def main() -> None:
     strategy_config = config.get("strategy", {})
     env_strategy_name = os.getenv("STRATEGY_NAME")
     if env_strategy_name:
-        # 当 STRATEGY_NAME 被设置时，直接从目标策略类读取 DEFAULT_PARAMS 作为参数
-        # 避免旧策略参数污染新策略，也避免通过实例化触发初始化和参数校验
+        # STRATEGY_NAME 环境变量覆盖：从目标策略类读取 DEFAULT_PARAMS，避免旧参数污染
         try:
             import importlib
             from strategies import BUILTIN_STRATEGIES
@@ -415,14 +413,10 @@ def load_full_df_for_replay(
     required_history_days: int,
     replay_data_end_date: str | None = None,
 ) -> pd.DataFrame | None:
-    """Load complete, standardized full_df for a stock for replay.
+    """加载 replay 用的完整日线数据（比 lookback_days 更长的历史）。
 
     Args:
-        replay_data_end_date: Fixed end date for replay data (YYYY-MM-DD string).
-            When provided, this replaces datetime.now() as the data boundary,
-            ensuring replay reproducibility across runs.
-
-    Returns DataFrame with datetime date column, or None if load failed.
+        replay_data_end_date: 固定数据边界 YYYY-MM-DD，确保 replay 可复现。
     """
     filename = symbol.replace(".", "_")
     file_path = os.path.join(DATA_DIR, f"{filename}.csv")
@@ -506,68 +500,48 @@ def load_full_df_for_replay(
 
 
 def generate_weekly_snapshot_dates(lookback_weeks: int) -> List[datetime]:
-    """Generate exactly ``lookback_weeks`` completed Friday snapshot dates.
+    """生成过去 N 周（默认 52 周）的周五 snapshot 日期列表。
 
-    Each snapshot represents the moment after a *completed* weekly trading
-    week.  The current week is excluded when its last trading day has not
-    yet passed (or on that day before 20:00).  Every included Friday is
-    anchored at 23:59:59 so that the weekly cutoff logic in
-    get_last_completed_week_end sees hour >= 20 consistently, regardless
-    of when the replay is actually run.
+    每个 snapshot 为周五 23:59:59，保证 replay 中 get_last_completed_week_end
+    看到 hour≥20 从而一致地将本周判定为"已完成"。
 
-    The date list is built by decrementing from the last completed Friday:
-    this guarantees that ``lookback_weeks=N`` produces exactly N snapshots
-    rather than N or N+1 depending on whether the window interval happens
-    to land on a Friday.
-
-    Args:
-        lookback_weeks: Number of completed weekly snapshots to generate.
-                        ``lookback_weeks=52`` returns exactly 52 snapshots.
+    通过从最后完成的周五递减生成，确保总是返回恰好 N 个 snapshot。
     """
     now = datetime.now()
     today = now.date()
     weekday = now.weekday()
 
-    # 1. Determine this week's Friday anchor (natural week)
-    if weekday < 4:  # Monday - Thursday
+    # 1. 确定本周的 Friday 锚点
+    if weekday < 4:
         this_friday_anchor = today + timedelta(days=4 - weekday)
-    elif weekday == 4:  # Friday
+    elif weekday == 4:
         this_friday_anchor = today
-    else:  # Saturday (5) or Sunday (6)
+    else:
         this_friday_anchor = today - timedelta(days=weekday - 4)
 
-    # 2. Query the last trading day of this week using the trading calendar
+    # 2. 查询本交易周最后一个交易日
     last_trading_day = None
     try:
         last_trading_day = get_last_trading_day_of_week(pd.Timestamp(today))
     except Exception:
-        # Any unexpected exception from the calendar query is treated as
-        # a failure — we fall back conservatively below.
         pass
 
-    # 3. Decide whether this week is completed
+    # 3. 判断本周是否已完成
     if last_trading_day is None:
-        # Calendar query failed — be conservative and fall back to the
-        # previous Friday anchor.
         last_completed_friday = this_friday_anchor - timedelta(weeks=1)
     else:
         last_trading_date = last_trading_day.date()
         if today < last_trading_date:
-            # Current date is before the last trading day of this week
             last_completed_friday = this_friday_anchor - timedelta(weeks=1)
         elif today > last_trading_date:
-            # Current date is after the last trading day of this week
             last_completed_friday = this_friday_anchor
         else:
-            # today == last_trading_date
             if now.hour < 20:
                 last_completed_friday = this_friday_anchor - timedelta(weeks=1)
             else:
                 last_completed_friday = this_friday_anchor
 
-    # Build exactly lookback_weeks snapshots by decrementing from the last
-    # completed Friday.  Decrementing by whole weeks guarantees we always
-    # land on a Friday.
+    # 从最后完成的周五向前递减，生成恰好 N 个周五日期
     friday_dates = []
     for i in range(lookback_weeks):
         friday = last_completed_friday - timedelta(weeks=i)
@@ -589,9 +563,9 @@ def load_historical_data_up_to_date(
     request_interval: float,
     full_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame | None:
-    """Load historical data up to (and including) the cutoff date.
+    """加载截止至 cutoff_date 的历史日线数据。
 
-    If full_df is provided, uses memory filtering instead of reading from disk.
+    如果提供了 full_df，则直接从内存过滤（replay 优化路径），不从磁盘读取。
     """
     if full_df is not None:
         filtered_df = full_df[full_df["date"] <= pd.Timestamp(cutoff_date)].copy()
@@ -663,9 +637,9 @@ def calculate_forward_returns(
     result: StrategyResult,
     full_df: pd.DataFrame | None = None,
 ) -> Dict[str, float]:
-    """Calculate 4-week, 8-week, and 12-week forward returns.
+    """计算信号日之后的 4w/8w/12w/16w/20w 前向收益率。
 
-    If full_df is provided, uses it instead of reading from disk.
+    若目标日期无交易，在 3 日内查找最近交易日；超过 3 日则返回 NaN。
     """
     forward_returns = {
         "return_4w": float("nan"),
@@ -754,7 +728,7 @@ def calculate_forward_returns(
 
     except Exception as exc:
         logger.debug("计算%s前向收益率失败: %s", symbol, exc)
-        raise  # Re-raise to be caught by per-symbol exception handler
+        raise
 
     return forward_returns
 
@@ -768,7 +742,7 @@ def build_replay_record(
     universe: str,
     lookback_weeks: int,
 ) -> Dict[str, Any]:
-    """Build a replay record with core signal fields and forward returns."""
+    """构建 replay 输出记录：核心信号字段 + 前向收益率。"""
     details = result.details
 
     def extract_date_string(date_value):
@@ -814,7 +788,7 @@ def build_replay_record(
     return record
 
 
-# Replay result CSV columns (must match build_replay_record output)
+# Replay 输出 CSV 列定义（需与 build_replay_record 保持一致）
 _REPLAY_RESULT_COLUMNS = [
     "experiment_tag",
     "universe",
@@ -847,26 +821,15 @@ def write_replay_results(
     version: str,
     snapshot_date: str,
 ) -> str:
-    """Write replay validation results to a per-snapshot CSV file.
+    """写入 per-snapshot replay 结果 CSV。
 
-    Each snapshot gets its own result file. Re-running the same snapshot
-    overwrites the file instead of appending, preventing duplicate rows.
-    Even empty results will produce a CSV with headers for schema stability.
-
-    Args:
-        results: List of replay records to write
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-        snapshot_date: Snapshot date in YYYY-MM-DD format
+    覆盖写入（非追加），即使结果为空也写出表头保持 schema 稳定。
     """
     replay_file = get_replay_snapshot_result_path(strategy_slug, universe, lookback_weeks, version, snapshot_date)
 
     if results:
         df = pd.DataFrame(results)
     else:
-        # Write empty CSV with headers for schema stability
         df = pd.DataFrame(columns=_REPLAY_RESULT_COLUMNS)
     df.to_csv(replay_file, index=False, encoding="utf-8-sig")
     logger.info("Replay results written to %s (%d rows)", replay_file, len(df))
@@ -881,25 +844,13 @@ def write_replay_errors(
     version: str,
     snapshot_date: str,
 ) -> str:
-    """Write replay error records to a per-snapshot CSV file.
+    """写入 per-snapshot replay 错误 CSV。
 
-    Each snapshot gets its own error file. Re-running the same snapshot
-    overwrites the file instead of appending, preventing duplicate rows.
-    If errors is empty, the old error file (if any) is removed to prevent
-    stale error records from persisting.
-
-    Args:
-        errors: List of error records to write
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-        snapshot_date: Snapshot date in YYYY-MM-DD format
+    覆盖写入，错误列表为空时删除旧错误文件（防残留）。
     """
     error_file = get_replay_snapshot_error_path(strategy_slug, universe, lookback_weeks, version, snapshot_date)
 
     if not errors:
-        # No errors this run — remove stale error file if it exists
         try:
             if os.path.exists(error_file):
                 os.remove(error_file)
@@ -916,15 +867,6 @@ def write_replay_errors(
 
 
 def get_replay_snapshot_result_path(strategy_slug: str, universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
-    """Return the per-snapshot result file path for a replay experiment.
-
-    Args:
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-        snapshot_date: Snapshot date in YYYY-MM-DD format
-    """
     return os.path.join(
         VALIDATION_DIR,
         "replay",
@@ -933,15 +875,6 @@ def get_replay_snapshot_result_path(strategy_slug: str, universe: str, lookback_
 
 
 def get_replay_snapshot_error_path(strategy_slug: str, universe: str, lookback_weeks: int, version: str, snapshot_date: str) -> str:
-    """Return the per-snapshot error file path for a replay experiment.
-
-    Args:
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-        snapshot_date: Snapshot date in YYYY-MM-DD format
-    """
     return os.path.join(
         VALIDATION_DIR,
         "replay",
@@ -950,14 +883,6 @@ def get_replay_snapshot_error_path(strategy_slug: str, universe: str, lookback_w
 
 
 def get_replay_checkpoint_path(strategy_slug: str, universe: str, lookback_weeks: int, version: str) -> str:
-    """Return the checkpoint path for a replay experiment.
-
-    Args:
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-    """
     return os.path.join(
         VALIDATION_DIR,
         "replay",
@@ -972,21 +897,9 @@ def _verify_completed_snapshot_files(
     lookback_weeks: int,
     version: str,
 ) -> None:
-    """Verify that all completed snapshots have their result files.
+    """校验 checkpoint 中标记为 completed 的 snapshot 都有对应的结果文件。
 
-    This is a conservative check: if the checkpoint claims a snapshot is
-    completed but the corresponding result file is missing, we refuse to
-    resume to avoid inconsistent state.
-
-    Args:
-        completed_snapshots: List of completed snapshot dates (YYYY-MM-DD)
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-
-    Raises:
-        RuntimeError: If any completed snapshot is missing its result file.
+    任一缺失即拒绝 resume（防不一致状态）。
     """
     missing_files = []
 
@@ -1011,15 +924,7 @@ def _verify_completed_snapshot_files(
 
 
 def _summarize_failed_symbols(failed_symbols_per_snapshot: Dict[str, List[str]]) -> str:
-    """Build a human-readable summary of unresolved failed symbols.
-
-    Returns a log-ready string or empty string when there are no unresolved
-    failures.  Shows the total snapshot/symbol counts and up to 5 example
-    snapshots with the first few failed symbols each.
-
-    Args:
-        failed_symbols_per_snapshot: dict of snapshot_date → failed symbols.
-    """
+    """生成可读的失败 symbol 摘要日志（含前 5 个 snapshot 样例）。"""
     if not failed_symbols_per_snapshot:
         return ""
     total_snapshots = len(failed_symbols_per_snapshot)
@@ -1042,7 +947,7 @@ def _summarize_failed_symbols(failed_symbols_per_snapshot: Dict[str, List[str]])
 
 
 def load_replay_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
-    """Load a replay checkpoint from JSON."""
+    """从 JSON 加载 replay checkpoint。"""
     with open(checkpoint_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -1056,19 +961,15 @@ def validate_replay_checkpoint(
     expected_snapshot_dates: List[str],
     expected_replay_data_end_date: str | None = None,
 ) -> List[str]:
-    """Validate checkpoint identity and return completed snapshots.
+    """校验 checkpoint 身份一致性，返回已完成的 snapshot 列表。
 
-    Checkpoint is the only source of truth for completed snapshot state.
-    CSV outputs are result carriers only and must not be used to infer progress.
+    Checkpoint 是进度的唯一权威来源，CSV 输出仅作为结果载体不可用来推断进度。
 
-    The snapshot window identity (``snapshot_dates``) is now validated so
-    that a checkpoint created during an earlier run with a *different*
-    snapshot window is never mistaken for the same experiment.  This
-    prevents silently merging results from two different time windows.
-
-    The ``replay_data_end_date`` is validated to ensure the same data
-    boundary is used across resume runs, preventing data drift when
-    the replay is resumed on a different day.
+    校验项：
+      - experiment_tag / universe / lookback_weeks / version
+      - snapshot_dates（完整快照窗口一致性）
+      - replay_data_end_date（数据边界一致性）
+      - completed_snapshots 类型/格式
     """
     expected_fields = {
         "experiment_tag": experiment_tag,
@@ -1089,11 +990,7 @@ def validate_replay_checkpoint(
             f"{mismatch_text}"
         )
 
-    # Validate snapshot window identity: the full set of snapshot dates
-    # must be identical between the checkpoint and the current run.
-    # Without this, a checkpoint from a run weeks ago could be mistaken
-    # as resume-compatible even though the generated snapshot windows
-    # are different.
+    # 校验 snapshot_dates：必须与当前运行完全一致
     checkpoint_snapshot_dates = checkpoint.get("snapshot_dates")
     if checkpoint_snapshot_dates is None:
         raise RuntimeError(
@@ -1123,8 +1020,7 @@ def validate_replay_checkpoint(
             "Cannot safely resume — these are different snapshot windows."
         )
 
-    # Validate replay_data_end_date: the data boundary must be identical
-    # between the checkpoint and the current run to ensure reproducibility.
+    # 校验 replay_data_end_date：数据边界必须一致
     checkpoint_replay_data_end_date = checkpoint.get("replay_data_end_date")
     if checkpoint_replay_data_end_date is None:
         raise RuntimeError(
@@ -1148,9 +1044,7 @@ def validate_replay_checkpoint(
     if not isinstance(completed_snapshots, list) or any(not isinstance(item, str) for item in completed_snapshots):
         raise RuntimeError("Replay checkpoint has invalid completed_snapshots; expected a list of YYYY-MM-DD strings")
 
-    # Validate failed_symbols_per_snapshot if present.
-    # This is a quality/omission truth (NOT a progress blocker).
-    # A completed snapshot MAY have failed symbols — this is a valid state.
+    # 校验 failed_symbols_per_snapshot（可选字段，仅做质量记录不做进度阻断）
     failed_symbols = checkpoint.get("failed_symbols_per_snapshot")
     if failed_symbols is not None:
         if not isinstance(failed_symbols, dict):
@@ -1184,19 +1078,11 @@ def save_replay_checkpoint(
     replay_data_end_date: str | None = None,
     failed_symbols_per_snapshot: Dict[str, List[str]] | None = None,
 ) -> None:
-    """Persist replay checkpoint JSON for snapshot-level resume.
+    """持久化 replay checkpoint，支持 snapshot 级 resume。
 
-    ``snapshot_dates`` encodes the full snapshot window identity so that
-    a future resume can verify that it is resuming the *same* window,
-    not a different window generated weeks later.
-
-    ``replay_data_end_date`` fixes the data boundary for replay so that
-    the same experiment always uses identical data, regardless of when
-    the replay is resumed.
-
-    ``failed_symbols_per_snapshot`` is the structured record of which
-    symbols failed in each completed snapshot.  It is a quality/omission
-    truth, NOT a progress blocker.
+    - snapshot_dates: 编码完整快照窗口身份，用于 resume 时校验
+    - replay_data_end_date: 固定数据边界，保证 resume 时使用相同数据
+    - failed_symbols_per_snapshot: 失败 symbol 的记录，仅做质量观测不做进度阻断
     """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     checkpoint: Dict[str, Any] = {
@@ -1230,45 +1116,32 @@ def save_replay_checkpoint(
 # ---------------------------------------------------------------------------
 # Weekly-strategy replay optimization v1
 #
-# These helpers exist exclusively for the weekly-strategy replay path.
-# They pre-compute a full weekly bar series once per symbol so that the
-# inner snapshot loop only needs a cheap cutoff slice instead of a full
-# daily→weekly resample on every snapshot.
+# 周线策略 replay 加速专用路径：预先从 full_df 计算全量周线，每个 snapshot
+# 只需做廉价切片，避免对每个 snapshot 重复 reample。
 #
-# Why only weekly strategies?
-#   Daily-bar strategies (e.g. moving_average) consume the daily slice
-#   directly and have no equivalent "resample once, slice many times"
-#   opportunity.  If daily-strategy replay ever needs acceleration, it
-#   should get its own daily-specific precompute path rather than reusing
-#   this weekly cache.
+# 适用策略：momentum_reversal_13, black_horse（在 _WEEKLY_REPLAY_STRATEGIES 中声明）
+# 日线策略（如 moving_average）不走此路径。
 #
-# Why this doesn't change completed-week semantics:
-#   The full weekly series is built with convert_daily_to_weekly(full_df)
-#   — no cutoff applied yet.  The per-snapshot cutoff is applied by
-#   slice_weekly_bars_for_snapshot, which mirrors exactly what
-#   get_completed_weekly_bars does: it truncates at the last completed
-#   Friday anchor for the given snapshot_date.  The strategy therefore
-#   sees the same weekly bars it would have seen without the cache.
+# 等价性保证：
+#   precompute = convert_daily_to_weekly(full_df, cutoff_date=None)  — 不截断
+#   slice_weekly_bars_for_snapshot 用 date <= friday_anchor 截断
+#   结果等同于 get_completed_weekly_bars 在对应 snapshot 时刻的输出。
 #
-#   With the symbol-level completeness guard (trading_days_count ≥ 3,
-#   last_daily_date ≥ last_trading_day), this path is now slightly
-#   stricter than get_completed_weekly_bars for extreme short weeks
-#   (≤2 trading days).  Only the last bar is validated; earlier
-#   historical bars are trusted as-is.
+# 符号级完成守卫：
+#   _guard_snapshot_week_completion 对 snapshot 边界处的末根 bar 做校验：
+#   - last_daily_date < last_trading_day → 丢弃（数据不完整）
+#   - last_trading_day 为 None → 保守丢弃（日历查询失败）
+#   仅校验末根 bar；历史 bar 信任 full_df 的原始数据。
 # ---------------------------------------------------------------------------
 
-# Strategies that consume completed weekly bars and can benefit from the
-# weekly precompute cache.  Non-weekly strategies are NOT in this set and
-# will continue to use the standard daily-slice path.
 _WEEKLY_REPLAY_STRATEGIES = frozenset({"momentum_reversal_13", "black_horse"})
 
 
 def get_replay_strategy_slug(strategy_name: str) -> str:
-    """Return the stable replay experiment slug for a strategy name.
+    """返回 replay 实验的策略标识 slug。
 
-    ``momentum_reversal_13`` keeps the historical ``mr13`` slug so existing
-    replay checkpoints/results remain resume-compatible. Other strategies use
-    their configured strategy name directly.
+    momentum_reversal_13 → mr13（保持与历史 checkpoint 兼容）
+    其他策略使用策略名本身。
     """
     legacy_slug_map = {
         "momentum_reversal_13": "mr13",
@@ -1277,15 +1150,7 @@ def get_replay_strategy_slug(strategy_name: str) -> str:
 
 
 def precompute_weekly_bars_for_replay(full_df: pd.DataFrame) -> pd.DataFrame:
-    """Build a complete Friday-anchored weekly bar series from full daily data.
-
-    Called once per symbol before the snapshot loop.  The result is stored
-    in weekly_full_cache and sliced per snapshot by
-    slice_weekly_bars_for_snapshot.
-
-    No cutoff is applied here — the full history is kept so that any
-    snapshot date can be served from this single precomputed series.
-    """
+    """从全量日线预计算 W-FRI 周线序列（无截断）。"""
     from data_utils import convert_daily_to_weekly
     return convert_daily_to_weekly(full_df, cutoff_date=None)
 
@@ -1295,17 +1160,13 @@ def _guard_snapshot_week_completion(
     friday_anchor: pd.Timestamp,
     snapshot_week_last_trading_day: object,
 ) -> pd.DataFrame:
-    """保守守卫：交易日历查询失败时，丢弃快照周最后一根未完成周线。
-    
-    统一主路径与 fallback 路径在 calendar query failure 时的语义：
-    - 若 snapshot_week_last_trading_day 为 None（日历查询失败）
-    - 且最后一根周线锚定在快照周（friday_anchor）
-    - 则保守丢弃该最后一根 bar
-    - 更早历史周线不受影响
+    """保守守卫：日历查询失败或数据不完整时丢弃 snapshot 周的末根 bar。
+
+    统一主路径与 fallback 路径在 calendar 异常时的语义。仅检查末根 bar，
+    历史周线不受影响。
     """
     if weekly_bars.empty:
         return weekly_bars
-    # 检查是否有守卫所需字段
     has_guard_fields = (
         "trading_days_count" in weekly_bars.columns
         and "last_daily_date" in weekly_bars.columns
@@ -1314,15 +1175,11 @@ def _guard_snapshot_week_completion(
         return weekly_bars
     last_bar = weekly_bars.iloc[-1]
     last_bar_date = pd.Timestamp(last_bar["date"])
-    # 最后一根不属于快照周，无需处理
     if last_bar_date != friday_anchor:
         return weekly_bars
-    # 最后一根属于快照周，应用守卫逻辑
     last_trading_day = snapshot_week_last_trading_day
     if last_trading_day is None:
-        # 日历查询失败，保守丢弃最后一根
         return weekly_bars.iloc[:-1]
-    # 以下为主路径已有的其他检查（保持行为一致）
     last_daily_date = pd.Timestamp(last_bar["last_daily_date"])
     if last_daily_date < pd.Timestamp(last_trading_day):
         return weekly_bars.iloc[:-1]
@@ -1337,37 +1194,16 @@ def slice_weekly_bars_for_snapshot(
     snapshot_date: datetime,
     snapshot_week_last_trading_day: object = None,
 ) -> pd.DataFrame:
-    """Return completed weekly bars visible at snapshot_date.
+    """返回 snapshot 时刻可见的已完成周线。
 
-    Mirrors the cutoff logic of get_completed_weekly_bars:
-    - snapshot_date carries hour=23:59:59 (set by generate_weekly_snapshot_dates)
-    - That means it is always a Friday after 20:00, so the completed-week
-      anchor is this Friday itself (not the previous one).
-    - We keep all weekly bars whose date <= snapshot_date's Friday anchor.
+    等价于在对应 snapshot 调用 get_completed_weekly_bars，
+    但通过预计算避免重复 reample。
 
-    Completeness guard (symbol-level):
-    The last bar in the sliced result is only kept when it represents a truly
-    *completed* trading week.  A bar anchored at the snapshot Friday that was
-    built from only Mon-Wed daily data (because the symbol's full_df stopped
-    early) is a "half-week" phantom and must be dropped.
-
-    ``snapshot_week_last_trading_day`` is pre-queried once per snapshot week
-    (NOT per symbol) and passed in.  When it is None the guard is
-    conservative and drops the last bar.
-
-    This is semantically equivalent to calling get_completed_weekly_bars
-    on the daily slice, but avoids the resample on every snapshot.
-
-    Equivalence note:
-    - This guard is slightly stricter than get_completed_weekly_bars for
-      holiday-shortened weeks with 1-2 trading days (threshold = 3).
-    - Only the last bar is validated; earlier historical bars are trusted
-      as-is from full_df.
+    符号级守卫：snapshot_week_last_trading_day 为 None 时保守丢弃末根 bar。
     """
     if weekly_full.empty:
         return weekly_full
 
-    # snapshot_date is a Friday at 23:59:59 — the Friday anchor IS snapshot_date.date()
     friday_anchor = pd.Timestamp(snapshot_date.date())
     sliced = weekly_full[weekly_full["date"] <= friday_anchor].copy()
 
@@ -1378,22 +1214,19 @@ def slice_weekly_bars_for_snapshot(
 
 
 def run_weekly_replay_validation(resume: bool = True) -> None:
-    """Run weekly historical replay validation for the last lookback_weeks.
+    """运行周级历史 replay 验证。
 
-    How to Run:
+    用法：
         py -3.13 -c "from scanner_app import run_weekly_replay_validation; run_weekly_replay_validation()"
 
+    范围：
+      - 股票池：全 A 股
+      - 时间：最近 lookback_weeks 个 snapshot（默认 52 周）
+      - 策略：由 config.json 中 strategy.name 指定
 
-    Scope:
-    - Universe: all A-shares only
-    - Time range: most recent lookback_weeks (default 52 weeks)
-    - Replay frequency: one run per completed weekly bar
-    - Strategy: selected by ``strategy_name`` below
-
-    Output: validation/replay/replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv
-            (per-snapshot result files, overwritten on re-run)
-            validation/replay/replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv
-            (per-snapshot error files, overwritten on re-run)
+    输出：
+      validation/replay/replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}.csv
+      validation/replay/replay_{strategy_slug}_{universe}_{lookback_weeks}w_{version}_{snapshot_date}_errors.csv
     """
     logger.info("=" * 60)
     logger.info("Starting weekly historical replay validation")
@@ -1444,14 +1277,10 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         weekly_dates = generate_weekly_snapshot_dates(lookback_weeks)
         logger.info("Generated %s weekly snapshot dates", len(weekly_dates))
 
-        # Build the snapshot window identity once: this list is the
-        # authoritative window for the current run and is stored in the
-        # checkpoint so future resumes can verify they target the same window.
+        # 构建一次性快照窗口标识，写入 checkpoint 供 resume 校验
         snapshot_dates_str = [d.strftime("%Y-%m-%d") for d in weekly_dates]
 
-        # Calculate fixed replay_data_end_date: the data boundary for this replay experiment.
-        # This ensures the same data is used regardless of when the replay is resumed.
-        # Use last snapshot + 21 weeks (20 weeks max forward return + 1 week buffer).
+        # 计算固定 replay 数据边界：最后 snapshot + 21 周（20 周最大 forward return + 1 周 buffer）
         last_snapshot_date = max(weekly_dates).date()
         replay_data_end_date = (last_snapshot_date + timedelta(weeks=21)).strftime("%Y-%m-%d")
         logger.info("Replay data end date (fixed): %s", replay_data_end_date)
@@ -1467,7 +1296,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             logger.info("[Replay] Checkpoint detected: %s", checkpoint_path)
             checkpoint = load_replay_checkpoint(checkpoint_path)
 
-            # Validate checkpoint and get completed snapshots
             completed_snapshots = validate_replay_checkpoint(
                 checkpoint,
                 experiment_tag,
@@ -1478,7 +1306,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 expected_replay_data_end_date=replay_data_end_date,
             )
 
-            # Use the replay_data_end_date from checkpoint for resume
             resume_replay_data_end_date = checkpoint.get("replay_data_end_date")
             if resume_replay_data_end_date is None:
                 raise RuntimeError(
@@ -1488,17 +1315,15 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     "Cannot safely resume — please delete the checkpoint or "
                     "run a fresh replay with the new schema."
                 )
-            # For resume, use the checkpoint's value to ensure consistency
             replay_data_end_date = resume_replay_data_end_date
             logger.info("[Replay] Resume with replay_data_end_date: %s", replay_data_end_date)
 
-            # Verify checkpoint consistency: all completed snapshots must have their result files
+            # 校验：所有已完成的 snapshot 必须有对应结果文件
             _verify_completed_snapshot_files(
                 completed_snapshots, strategy_slug, universe, lookback_weeks, version
             )
 
-            # Extract and log any unresolved failed symbols from previous runs.
-            # These are quality/omission records — they do NOT block resume.
+            # 输出之前未解决的失败 symbol 摘要（不影响 resume）
             failed_symbols_per_snapshot = checkpoint.get("failed_symbols_per_snapshot", {})
             if failed_symbols_per_snapshot:
                 summary = _summarize_failed_symbols(failed_symbols_per_snapshot)
@@ -1509,11 +1334,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
             logger.info("[Replay] No checkpoint detected; starting fresh replay run")
 
         if run_mode == "fresh":
-            # Conservative: refuse to silently destroy existing per-snapshot output files
-            # when there is no checkpoint. The checkpoint is the sole source of truth;
-            # per-snapshot CSV files are just result carriers and must not be
-            # used to infer completion status or overwrite intent.
-            # Only check files belonging to the current strategy_slug.
+            # 防守性检查：无 checkpoint 但已有同一策略的输出文件时，拒绝静默覆盖
             replay_dir = os.path.join(VALIDATION_DIR, "replay")
             if os.path.exists(replay_dir):
                 import glob
@@ -1532,7 +1353,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         "Please manually remove or relocate the existing output file(s) "
                         "before running the replay again."
                     )
-            # Remove any stale checkpoint to start clean
             if os.path.exists(checkpoint_path):
                 os.remove(checkpoint_path)
 
@@ -1551,19 +1371,13 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
         )
 
         if run_mode == "fresh":
-            # For fresh run, remove any existing checkpoint to start clean
             if os.path.exists(checkpoint_path):
                 os.remove(checkpoint_path)
 
         full_df_cache: Dict[str, pd.DataFrame | None] = {}
-        # Weekly-strategy replay optimization v1:
-        # Pre-computed full weekly bar series, keyed by symbol.
-        # Built once per symbol from full_df; each snapshot slices it cheaply.
-        # Only populated when the strategy is in _WEEKLY_REPLAY_STRATEGIES.
-        # Daily-strategy replay does not use this cache.
         weekly_full_cache: Dict[str, pd.DataFrame | None] = {}
         use_weekly_cache = strategy.name in _WEEKLY_REPLAY_STRATEGIES
-        SLOW_SYMBOL_THRESHOLD = 3.0  # seconds — warn if a single symbol exceeds this
+        SLOW_SYMBOL_THRESHOLD = 3.0
 
         for snapshot_idx, snapshot_date in enumerate(weekly_dates, 1):
             snapshot_start = time.time()
@@ -1581,7 +1395,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 snapshot_idx, len(weekly_dates), snapshot_date_str,
             )
 
-            # 输出 snapshot 对应周的 trading-week 元数据（用于语义可解释性）
+            # 输出该 snapshot 对应自然周的交易日历元数据（用于语义分析）
             try:
                 week_info = get_snapshot_trading_week_info(snapshot_date)
                 logger.info(
@@ -1594,7 +1408,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     week_info["trading_days_count"],
                 )
             except Exception as exc:
-                # 元数据查询失败不应影响 replay 主流程
                 logger.debug(
                     "[Replay] Snapshot %d/%d trading-week info query failed: date=%s error=%s",
                     snapshot_idx, len(weekly_dates), snapshot_date_str, exc,
@@ -1611,9 +1424,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 logger.debug("Strategy skipped for %s: %s",
                            snapshot_date_str, decision.reason_text)
 
-                # This snapshot has been fully evaluated: the snapshot-level
-                # decision is complete.  Mark it as completed so that resume
-                # will skip it on the next run.
                 snapshot_elapsed = time.time() - snapshot_start
                 logger.info(
                     "[Replay] Snapshot %d/%d done (no-op): date=%s elapsed=%.1fs "
@@ -1621,17 +1431,13 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     snapshot_idx, len(weekly_dates), snapshot_date_str, snapshot_elapsed,
                 )
 
-                # Write result carrier file first (even if empty) before checkpoint
                 write_replay_results(
                     [], strategy_slug, universe, lookback_weeks, version, snapshot_date_str
                 )
-
-                # Clean up any stale error file for this no-op snapshot
                 write_replay_errors(
                     [], strategy_slug, universe, lookback_weeks, version, snapshot_date_str
                 )
 
-                # Now mark as completed and save checkpoint
                 completed_snapshot_set.add(snapshot_date_str)
                 completed_snapshots.append(snapshot_date_str)
                 completed_snapshots.sort()
@@ -1672,7 +1478,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 current_stage = "unknown"
 
                 try:
-                    # Stage: load_full_df_for_replay
                     if symbol not in full_df_cache:
                         t0 = time.time()
                         current_stage = "load_full_df"
@@ -1682,11 +1487,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         )
                         stage_times["load_full_df"] = time.time() - t0
 
-                        # Weekly-strategy replay optimization v1:
-                        # Pre-compute full weekly bars once per symbol so that
-                        # each snapshot only needs a cheap cutoff slice.
-                        # This is the weekly-specific acceleration path; daily
-                        # strategies do not populate weekly_full_cache.
                         if use_weekly_cache and full_df_cache[symbol] is not None:
                             weekly_full_cache[symbol] = precompute_weekly_bars_for_replay(
                                 full_df_cache[symbol]
@@ -1698,7 +1498,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                         exit_stage = "full_df_empty"
 
                     if not exit_stage:
-                        # Stage: load_historical_data_up_to_date
                         t0 = time.time()
                         current_stage = "load_historical"
                         df = load_historical_data_up_to_date(
@@ -1712,38 +1511,28 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     if not exit_stage:
                         processed_count += 1
 
-                        # Stage: strategy.scan
-                        # Weekly-strategy replay optimization v1:
-                        # For weekly strategies, pass the pre-sliced weekly bars
-                        # so the strategy skips the daily→weekly resample.
-                        # Non-weekly strategies use the standard call path.
                         t0 = time.time()
                         current_stage = "scan"
                         if use_weekly_cache and symbol in weekly_full_cache and weekly_full_cache[symbol] is not None:
-                            # Main path: use precomputed weekly cache
+                            # 主路径：使用预计算 weekly cache
                             precomputed_weekly = slice_weekly_bars_for_snapshot(
                                 weekly_full_cache[symbol], snapshot_date,
                                 snapshot_week_last_trading_day,
                             )
                             result = strategy.scan(symbol, df, context, precomputed_weekly=precomputed_weekly)
                         elif use_weekly_cache:
-                            # Weekly fallback path: weekly strategy but cache unavailable
-                            # Unify with main path by computing weekly bars and applying guard
+                            # Fallback：weekly cache 不可用时从日线实时计算（与主路径保持相同守卫逻辑）
                             from data_utils import convert_daily_to_weekly
-                            # Compute full weekly bars from daily data (same as precompute path)
                             weekly_full = convert_daily_to_weekly(df, cutoff_date=None)
-                            # Slice for snapshot with conservative guard (same as main path)
                             precomputed_weekly = slice_weekly_bars_for_snapshot(
                                 weekly_full, snapshot_date, snapshot_week_last_trading_day
                             )
                             result = strategy.scan(symbol, df, context, precomputed_weekly=precomputed_weekly)
                         else:
-                            # Non-weekly strategy: standard call path, no precomputed_weekly
                             result = strategy.scan(symbol, df, context)
                         stage_times["scan"] = time.time() - t0
                         matched = result.matched
 
-                        # Stage: calculate_forward_returns (matched only)
                         if matched:
                             t0 = time.time()
                             current_stage = "calc_returns"
@@ -1762,14 +1551,12 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     failed_count += 1
                     snapshot_failed_symbols.append(symbol)
 
-                    # Log error
                     logger.error(
                         "[Replay] Snapshot %d/%d date=%s symbol %s failed at stage %s: %s: %s",
                         snapshot_idx, len(weekly_dates), snapshot_date_str, symbol, current_stage,
                         exc.__class__.__name__, str(exc)
                     )
 
-                    # Create error record
                     error_record = {
                         "experiment_tag": experiment_tag,
                         "snapshot_date": snapshot_date_str,
@@ -1781,7 +1568,7 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                     }
                     snapshot_errors.append(error_record)
 
-                # -- Unified symbol-level observability 收口 --
+                # 统一符号级可观察性日志收口
                 symbol_elapsed = time.time() - symbol_start
 
                 if symbol_idx % 100 == 0 or matched or symbol_failed:
@@ -1814,22 +1601,18 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
 
             snapshot_elapsed = time.time() - snapshot_start
 
-            # Write per-snapshot result file (even if empty — ensures carrier file exists)
+            # 先写文件再更新 checkpoint（崩溃时 checkpoint 不标记为已完成）
             write_replay_results(
                 snapshot_results, strategy_slug, universe, lookback_weeks, version, snapshot_date_str
             )
-
-            # Write per-snapshot error file (overwrite mode; removes stale file if no errors)
             write_replay_errors(
                 snapshot_errors, strategy_slug, universe, lookback_weeks, version, snapshot_date_str
             )
 
-            # Only after files are written successfully, mark snapshot as completed
             completed_snapshot_set.add(snapshot_date_str)
             completed_snapshots.append(snapshot_date_str)
             completed_snapshots.sort()
 
-            # Update failed_symbols_per_snapshot: record failed symbols or clear stale entry
             if snapshot_failed_symbols:
                 failed_symbols_per_snapshot[snapshot_date_str] = sorted(
                     list(set(snapshot_failed_symbols))
@@ -1844,7 +1627,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 snapshot_elapsed, processed_count, len(snapshot_results), failed_count,
             )
 
-            # Save checkpoint after successful file write
             save_replay_checkpoint(
                 checkpoint_path,
                 experiment_tag,
@@ -1857,7 +1639,6 @@ def run_weekly_replay_validation(resume: bool = True) -> None:
                 failed_symbols_per_snapshot=failed_symbols_per_snapshot,
             )
 
-        # Log unresolved failure summary at replay end
         if failed_symbols_per_snapshot:
             summary = _summarize_failed_symbols(failed_symbols_per_snapshot)
             logger.warning(summary)
@@ -1876,22 +1657,7 @@ def merge_replay_snapshot_files(
     version: str,
     output_path: str | None = None,
 ) -> str:
-    """Merge per-snapshot result files into a single CSV.
-
-    This is a helper function for downstream analysis. It reads all
-    per-snapshot result files matching the pattern and merges them
-    into a single CSV file.
-
-    Args:
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-        output_path: Output file path. If None, defaults to the old aggregate name.
-
-    Returns:
-        Path to the merged CSV file.
-    """
+    """合并 per-snapshot 结果文件为单个 CSV。"""
     import glob
 
     replay_dir = os.path.join(VALIDATION_DIR, "replay")
@@ -1930,22 +1696,7 @@ def merge_replay_error_snapshot_files(
     version: str,
     output_path: str | None = None,
 ) -> str:
-    """Merge per-snapshot error files into a single CSV.
-
-    This is a helper function for downstream analysis. It reads all
-    per-snapshot error files matching the pattern and merges them
-    into a single CSV file.
-
-    Args:
-        strategy_slug: Strategy identifier slug (e.g. mr13, black_horse)
-        universe: Stock universe identifier
-        lookback_weeks: Number of weeks looked back
-        version: Version identifier
-        output_path: Output file path. If None, defaults to the old aggregate name.
-
-    Returns:
-        Path to the merged CSV file.
-    """
+    """合并 per-snapshot 错误文件为单个 CSV。"""
     import glob
 
     replay_dir = os.path.join(VALIDATION_DIR, "replay")

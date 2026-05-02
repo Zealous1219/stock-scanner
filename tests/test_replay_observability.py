@@ -9,6 +9,7 @@ Covers:
 """
 
 import logging
+import tempfile
 import os
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -100,8 +101,9 @@ class TestSnapshotLogging:
         mock_create.return_value = strategy
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Check snapshot start logs
         start_logs = [r for r in caplog.records if "Snapshot" in r.message and "started" in r.message]
         assert len(start_logs) == 2, f"Expected 2 snapshot-start logs, got {len(start_logs)}"
@@ -160,8 +162,9 @@ class TestSymbolProgressLogging:
         mock_create.return_value = strategy
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         symbol_logs = [r for r in caplog.records if "[Replay]" in r.message and "symbol" in r.message.lower()]
         assert any("matched=True" in r.message for r in symbol_logs), \
             "Expected a symbol log with matched=True"
@@ -204,8 +207,9 @@ class TestSymbolProgressLogging:
         mock_create.return_value = strategy
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Find the per-100 progress log
         progress_logs = [
             r for r in caplog.records
@@ -289,8 +293,9 @@ class TestSlowSymbolWarning:
         mock_time.side_effect = lambda: next(time_values)
 
         with caplog.at_level(logging.WARNING):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         slow_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "Slow symbol" in r.message]
         assert len(slow_warnings) >= 1, (
             f"Expected at least 1 slow-symbol WARNING, got {len(slow_warnings)}. "
@@ -350,8 +355,9 @@ class TestStageTiming:
         mock_create.return_value = strategy
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         symbol_logs = [
             r for r in caplog.records
             if "[Replay]" in r.message and "symbol" in r.message and "matched=True" in r.message
@@ -422,8 +428,9 @@ class TestProcessedCount:
         mock_load_hist.side_effect = mock_hist_df
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         done_logs = [r for r in caplog.records if "[Replay]" in r.message and "done" in r.message]
         assert len(done_logs) == 1
         # Only sh.000003 was processed (passed both full_df and df filters)
@@ -481,8 +488,9 @@ class TestEarlyExitObservability:
         mock_time.side_effect = tick
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # The per-100 log at symbol idx=100 should exist and include exit=full_df_empty
         per100_logs = [
             r for r in caplog.records
@@ -544,8 +552,9 @@ class TestEarlyExitObservability:
         mock_time.side_effect = lambda: next(time_values)
 
         with caplog.at_level(logging.WARNING):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         slow_warnings = [r for r in caplog.records if r.levelno >= logging.WARNING and "Slow symbol" in r.message]
         assert len(slow_warnings) >= 1, (
             f"Expected slow-symbol WARNING for early-exit symbol. "
@@ -608,8 +617,9 @@ class TestFaultTolerance:
         mock_load_hist.return_value = _make_df()
 
         with caplog.at_level(logging.ERROR):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Verify error was logged
         error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "failed at stage" in r.message]
         assert len(error_logs) == 1, f"Expected 1 error log, got {len(error_logs)}"
@@ -668,8 +678,9 @@ class TestFaultTolerance:
         mock_load_hist.return_value = _make_df()
 
         with caplog.at_level(logging.ERROR):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Verify error was logged
         error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "failed at stage" in r.message]
         assert len(error_logs) == 1, f"Expected 1 error log, got {len(error_logs)}"
@@ -726,8 +737,11 @@ class TestFaultTolerance:
 
         mock_calc_returns.side_effect = _calc_returns_side_effect
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # Verify error CSV was written (proves exception was caught and recorded)
         assert mock_write_errors.call_count == 1, f"Expected write_replay_errors to be called once, was called {mock_write_errors.call_count} times"
 
@@ -785,8 +799,9 @@ class TestFaultTolerance:
         mock_load_hist.side_effect = mock_hist_df
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Verify snapshot done log contains failed=0
         done_logs = [r for r in caplog.records if "[Replay]" in r.message and "done" in r.message]
         assert len(done_logs) == 1
@@ -848,8 +863,9 @@ class TestFaultTolerance:
         mock_create.return_value = strategy
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Verify snapshot done log contains failed=2
         done_logs = [r for r in caplog.records if "[Replay]" in r.message and "done" in r.message]
         assert len(done_logs) == 1
@@ -902,8 +918,9 @@ class TestFaultTolerance:
         mock_load_hist.side_effect = mock_hist_df
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Error was logged with correct stage
         error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "failed at stage" in r.message]
         assert len(error_logs) == 1, f"Expected 1 error log, got {len(error_logs)}"
@@ -971,8 +988,11 @@ class TestReplayCheckpointResume:
 
         mock_exists.side_effect = exists_side_effect
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         assert mock_write_results.call_count == 2
         assert mock_save_checkpoint.call_count == 2
 
@@ -1035,8 +1055,11 @@ class TestReplayCheckpointResume:
 
         mock_exists.side_effect = exists_side_effect
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         assert strategy.scan.call_count == 1
         processed_snapshot_dates = [call.args[2].now.strftime("%Y-%m-%d") for call in strategy.scan.call_args_list]
         assert processed_snapshot_dates == ["2025-05-16"]
@@ -1109,7 +1132,9 @@ class TestReplayCheckpointResume:
             "replay_data_end_date": "2025-10-03",  # 2025-05-09 + 21 weeks
         }):
             try:
-                run_weekly_replay_validation()
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                        run_weekly_replay_validation()
             except RuntimeError as exc:
                 assert "simulated interruption" in str(exc)
             else:
@@ -1128,8 +1153,11 @@ class TestReplayCheckpointResume:
 
         mock_write_results.side_effect = write_results_resume
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         processed_snapshot_dates = [call.args[2].now.strftime("%Y-%m-%d") for call in strategy.scan.call_args_list]
         assert processed_snapshot_dates == ["2025-05-09"]
         mock_save_checkpoint.assert_called_once()
@@ -1169,7 +1197,9 @@ class TestReplayCheckpointResume:
         mock_exists.side_effect = exists_side_effect
 
         try:
-            run_weekly_replay_validation()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         except RuntimeError as exc:
             message = str(exc)
         else:
@@ -1224,8 +1254,9 @@ class TestReplayCheckpointResume:
         mock_build_record.side_effect = mock_build
 
         with caplog.at_level(logging.INFO):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # Error was logged with stage=build_record (not calc_returns)
         error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "failed at stage" in r.message]
         assert len(error_logs) == 1, f"Expected 1 error log, got {len(error_logs)}"
@@ -1368,8 +1399,11 @@ class TestReplayCheckpointResume:
 
         mock_exists.side_effect = exists_side_effect_first
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # scan was only called for S1(2025-05-02) and S3(2025-05-16), NOT S2
         scanned_dates = [call.args[2].now.strftime("%Y-%m-%d") for call in strategy.scan.call_args_list]
         assert "2025-05-02" in scanned_dates, f"Expected scan on 2025-05-02, got {scanned_dates}"
@@ -1407,8 +1441,11 @@ class TestReplayCheckpointResume:
 
         mock_getsize.return_value = 10  # csv is non-empty
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # On resume, scan must not be called (all snapshots already completed)
         strategy.scan.assert_not_called()
         mock_save_checkpoint.assert_not_called()
@@ -1458,8 +1495,11 @@ class TestReplayCheckpointResume:
 
         mock_exists.side_effect = lambda path: False
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # S1: no errors → write_replay_errors([], ...)
         # S2: scan fails → write_replay_errors([{...}], ...)
         assert mock_write_errors.call_count == 2
@@ -1501,8 +1541,11 @@ class TestReplayCheckpointResume:
             path.endswith(".checkpoint.json") or path.endswith(".csv")
         )
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # S2 (can_run=False) calls write_replay_errors([], ...)
         # to clean up the stale error file from the first run
         mock_write_errors.assert_called_once()
@@ -1695,8 +1738,9 @@ class TestSnapshotTimeAnchor:
                 datetime(2025, 5, 2, 23, 59, 59),
                 datetime(2025, 5, 9, 23, 59, 59),
             ]
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         assert strategy.scan.call_count == 2
         for call in strategy.scan.call_args_list:
             ctx = call.args[2]  # StrategyContext is the 3rd arg to scan
@@ -1756,8 +1800,9 @@ class TestSnapshotTimeAnchor:
                 datetime(2025, 5, 2, 23, 59, 59),
                 datetime(2025, 5, 9, 23, 59, 59),
             ]
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         assert len(captured_now_values) == 2
         for now_val in captured_now_values:
             assert now_val.hour >= 20, (
@@ -1977,8 +2022,11 @@ class TestSnapshotWindowIdentity:
 
         mock_exists.side_effect = exists_side_effect
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # Only pending snapshots processed: 05-09 and 05-16
         assert strategy.scan.call_count == 2
         scanned_dates = [call.args[2].now.strftime("%Y-%m-%d") for call in strategy.scan.call_args_list]
@@ -2027,8 +2075,9 @@ class TestSnapshotWindowIdentity:
         mock_exists.side_effect = exists_side_effect
 
         with pytest.raises(RuntimeError) as exc_info:
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         message = str(exc_info.value)
         assert "snapshot window" in message.lower(), \
             f"Error must mention snapshot window: {message}"
@@ -2078,8 +2127,9 @@ class TestSnapshotWindowIdentity:
         mock_exists.side_effect = exists_side_effect
 
         with pytest.raises(RuntimeError) as exc_info:
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         message = str(exc_info.value)
         assert "snapshot_dates" in message.lower(), \
             f"Error must mention snapshot_dates: {message}"
@@ -2159,8 +2209,11 @@ class TestWeeklyReplayCachePath:
         strategy.scan.return_value = _make_unmatched_result()
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # 2 symbols × 1 precompute each = 2 total calls
         assert mock_precompute.call_count == 2, (
             f"Expected precompute called once per symbol (2), got {mock_precompute.call_count}"
@@ -2211,8 +2264,11 @@ class TestWeeklyReplayCachePath:
         strategy.scan.return_value = _make_unmatched_result()
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         assert strategy.scan.call_count == 1
         call_kwargs = strategy.scan.call_args.kwargs
         assert "precomputed_weekly" in call_kwargs, (
@@ -2261,8 +2317,11 @@ class TestWeeklyReplayCachePath:
         strategy.scan.return_value = _make_unmatched_result()
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         mock_precompute.assert_not_called()
         mock_slice.assert_not_called()
         # scan must be called without precomputed_weekly kwarg
@@ -2320,8 +2379,9 @@ class TestWeeklyReplayCachePath:
         mock_precompute.side_effect = precompute_side_effect
 
         with caplog.at_level(logging.ERROR):
-            run_weekly_replay_validation()
-
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
         # One error logged for sh.000002
         error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "failed at stage" in r.message]
         assert len(error_logs) == 1, f"Expected 1 error log, got {len(error_logs)}"
@@ -2378,8 +2438,11 @@ class TestWeeklyReplayCachePath:
         strategy.scan.return_value = _make_unmatched_result()
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # One checkpoint save per snapshot
         assert mock_save_checkpoint.call_count == 2, (
             f"Expected 2 checkpoint saves (one per snapshot), got {mock_save_checkpoint.call_count}"
@@ -2959,7 +3022,9 @@ class TestTradingWeekInfoFailurePath:
         # 运行 replay - 使用正确的函数签名
         # 应该正常跑完，不会因日志格式化问题而崩溃
         # 如果正常完成，测试通过；如果抛异常，测试失败
-        run_weekly_replay_validation(resume=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation(resume=False)
 
     def test_failure_log_format_correct(self):
         """直接验证修复后的日志格式（参数类型匹配）"""
@@ -3041,8 +3106,11 @@ class TestNarrowedFallbackPath:
         strategy.scan.return_value = _make_unmatched_result()
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # Verify strategy.scan was called with precomputed_weekly
         assert strategy.scan.called, "strategy.scan should have been called"
         call_kwargs = strategy.scan.call_args
@@ -3088,8 +3156,11 @@ class TestNarrowedFallbackPath:
         strategy.scan.return_value = _make_unmatched_result()
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
 
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+
+                run_weekly_replay_validation()
         # Verify strategy.scan was called WITHOUT precomputed_weekly
         assert strategy.scan.called, "strategy.scan should have been called"
         call_kwargs = strategy.scan.call_args

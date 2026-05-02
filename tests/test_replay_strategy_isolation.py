@@ -377,7 +377,9 @@ class TestReplayUsesConfigStrategyName:
         mock_exists.return_value = False
 
         from scanner_app import run_weekly_replay_validation
-        run_weekly_replay_validation(resume=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation(resume=False)
 
         mock_create_strategy.assert_called_once()
         call_args = mock_create_strategy.call_args[0][0]
@@ -407,7 +409,9 @@ class TestReplayUsesConfigStrategyName:
         mock_exists.return_value = False
 
         from scanner_app import run_weekly_replay_validation
-        run_weekly_replay_validation(resume=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation(resume=False)
 
         mock_create_strategy.assert_called_once()
         call_args = mock_create_strategy.call_args[0][0]
@@ -437,7 +441,9 @@ class TestReplayUsesConfigStrategyName:
         mock_exists.return_value = False
 
         from scanner_app import run_weekly_replay_validation
-        run_weekly_replay_validation(resume=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation(resume=False)
 
         mock_create_strategy.assert_called_once()
         call_args = mock_create_strategy.call_args[0][0]
@@ -466,7 +472,9 @@ class TestReplayUsesConfigStrategyName:
         mock_exists.return_value = False
 
         from scanner_app import run_weekly_replay_validation
-        run_weekly_replay_validation(resume=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation(resume=False)
 
         mock_create_strategy.assert_called_once()
         call_args = mock_create_strategy.call_args[0][0]
@@ -496,7 +504,9 @@ class TestReplayUsesConfigStrategyName:
         mock_exists.return_value = False
 
         from scanner_app import run_weekly_replay_validation
-        run_weekly_replay_validation(resume=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation(resume=False)
 
         mock_create_strategy.assert_called_once()
         call_args = mock_create_strategy.call_args[0][0]

@@ -11,6 +11,7 @@ Covers:
 """
 
 import logging
+import tempfile
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 import pytest
@@ -108,7 +109,9 @@ class TestPartialFailureStillCompleted:
         strategy.scan.side_effect = scan_side_effect
         mock_create.return_value = strategy
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation()
 
         assert mock_save_checkpoint.call_count == 2
 
@@ -193,7 +196,9 @@ class TestClearStaleFailureRecord:
             return path.endswith(".checkpoint.json") or path.endswith(".csv")
         mock_exists.side_effect = exists_side_effect
 
-        run_weekly_replay_validation()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                run_weekly_replay_validation()
 
         # After all 3 snapshots processed with no failures, failed_symbols_per_snapshot should be empty
         last_call = mock_save_checkpoint.call_args_list[-1]
@@ -348,7 +353,9 @@ class TestResumeSkipsCompletedWithFailures:
         mock_exists.side_effect = exists_side_effect
 
         with caplog.at_level(logging.WARNING):
-            run_weekly_replay_validation()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
 
         # Should have warnings about unresolved failures (at resume start AND at replay end)
         warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -486,7 +493,9 @@ class TestReplayEndUnresolvedSummary:
         mock_exists.side_effect = exists_side_effect
 
         with caplog.at_level(logging.WARNING):
-            run_weekly_replay_validation()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
 
         # After replay completes, there should be an end-of-replay warning
         warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -537,7 +546,9 @@ class TestReplayEndUnresolvedSummary:
         mock_exists.side_effect = exists_side_effect
 
         with caplog.at_level(logging.WARNING):
-            run_weekly_replay_validation()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                    run_weekly_replay_validation()
 
         # No unresolved failure warnings at end
         warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]

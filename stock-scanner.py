@@ -1,10 +1,4 @@
-﻿"""Thin launcher for stock scanner.
-
-Single source of runtime logic:
-- scanner_app.main
-
-This file only provides optional local overrides for quick manual runs.
-"""
+﻿"""薄启动器，调用 scanner_app.main()，支持本地覆盖。"""
 
 from __future__ import annotations
 
@@ -12,18 +6,15 @@ import os
 
 from scanner_app import main as scanner_main
 
-# Optional local overrides for manual runs.
-# Set to None to use config.json values.
-#默认保持None，仅用于临时调试
-STOCK_POOL = None  # hs300 | zz500 | sz50 | all | None
-STRATEGY_NAME = 'black_horse'  # black_horse | moving_average | None
+# 本地覆盖常量，设为 None 则使用 config.json,"black_horse","momentum_reversal_13"
+STOCK_POOL = None
+STRATEGY_NAME = None
 
 
 def apply_local_overrides() -> None:
-    """Expose optional local constants as environment overrides."""
+    """将本地常量设为环境变量，供 scanner 运行时读取。"""
     if STOCK_POOL:
         os.environ["STOCK_POOL"] = STOCK_POOL
-
     if STRATEGY_NAME:
         os.environ["STRATEGY_NAME"] = STRATEGY_NAME
 

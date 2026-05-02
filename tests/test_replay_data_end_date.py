@@ -10,6 +10,7 @@ Covers:
 """
 
 import pytest
+import tempfile
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
 import pandas as pd
@@ -120,7 +121,9 @@ class TestReplayDataEndDate:
                                                 with patch("scanner_app.os.path.exists", return_value=False):
                                                     with patch("scanner_app.os.path.getsize", return_value=0):
                                                         with patch("scanner_app.ensure_directories"):
-                                                            run_weekly_replay_validation()
+                                                            with tempfile.TemporaryDirectory() as tmpdir:
+                                                                with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                                                                    run_weekly_replay_validation()
 
         assert len(captured_end_dates) > 0, "load_full_df_for_replay should have been called with replay_data_end_date"
         assert captured_end_dates[0] == expected_end_date, (
@@ -179,8 +182,10 @@ class TestReplayDataEndDate:
                                                     with patch("scanner_app.os.path.exists") as mock_exists:
                                                         mock_exists.side_effect = lambda p: p.endswith(".checkpoint.json") or p.endswith(".csv")
                                                         with patch("scanner_app.os.path.getsize", return_value=10):
-                                                            with patch("scanner_app.ensure_directories"):
-                                                                run_weekly_replay_validation()
+                                                                with patch("scanner_app.ensure_directories"):
+                                                                    with tempfile.TemporaryDirectory() as tmpdir:
+                                                                        with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                                                                            run_weekly_replay_validation()
 
         assert len(captured_end_dates) > 0, "load_full_df_for_replay should have been called"
         assert captured_end_dates[0] == expected_end_date, (
@@ -219,7 +224,9 @@ class TestReplayDataEndDate:
                                 mock_exists.side_effect = lambda p: p.endswith(".checkpoint.json") or p.endswith(".csv")
                                 with patch("scanner_app.ensure_directories"):
                                     with pytest.raises(RuntimeError) as exc_info:
-                                        run_weekly_replay_validation()
+                                        with tempfile.TemporaryDirectory() as tmpdir:
+                                            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                                                run_weekly_replay_validation()
 
                                     message = str(exc_info.value)
                                     assert "replay_data_end_date" in message.lower(), (
@@ -262,7 +269,9 @@ class TestReplayDataEndDate:
                                 mock_exists.side_effect = lambda p: p.endswith(".checkpoint.json") or p.endswith(".csv")
                                 with patch("scanner_app.ensure_directories"):
                                     with pytest.raises(RuntimeError) as exc_info:
-                                        run_weekly_replay_validation()
+                                        with tempfile.TemporaryDirectory() as tmpdir:
+                                            with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                                                run_weekly_replay_validation()
 
                                     message = str(exc_info.value)
                                     assert "replay_data_end_date" in message.lower(), (
@@ -312,12 +321,16 @@ class TestReplayDataEndDate:
                                             with patch("scanner_app.write_replay_errors"):
                                                 with patch("scanner_app.os.path.exists", return_value=False):
                                                     with patch("scanner_app.os.path.getsize", return_value=0):
-                                                        with patch("scanner_app.ensure_directories"):
-                                                            # Simulate "first run"
-                                                            run_weekly_replay_validation()
+                                                            with patch("scanner_app.ensure_directories"):
+                                                                # Simulate "first run"
+                                                                with tempfile.TemporaryDirectory() as tmpdir:
+                                                                    with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                                                                        run_weekly_replay_validation()
 
-                                                            # Simulate "second run" on a different day
-                                                            run_weekly_replay_validation()
+                                                                # Simulate "second run" on a different day
+                                                                with tempfile.TemporaryDirectory() as tmpdir2:
+                                                                    with patch("scanner_app.VALIDATION_DIR", tmpdir2):
+                                                                        run_weekly_replay_validation()
 
         assert len(captured_end_dates) >= 2, (
             f"Expected at least 2 calls to load_full_df_for_replay, got {len(captured_end_dates)}"
@@ -368,8 +381,10 @@ class TestReplayDataEndDate:
                                                 with patch("scanner_app.save_replay_checkpoint", side_effect=mock_save_checkpoint):
                                                     with patch("scanner_app.os.path.exists", return_value=False):
                                                         with patch("scanner_app.os.path.getsize", return_value=0):
-                                                            with patch("scanner_app.ensure_directories"):
-                                                                run_weekly_replay_validation()
+                                                                with patch("scanner_app.ensure_directories"):
+                                                                    with tempfile.TemporaryDirectory() as tmpdir:
+                                                                        with patch("scanner_app.VALIDATION_DIR", tmpdir):
+                                                                            run_weekly_replay_validation()
 
         assert len(saved_checkpoints) > 0, "save_replay_checkpoint should have been called"
         found = False
